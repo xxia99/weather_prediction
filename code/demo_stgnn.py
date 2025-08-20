@@ -10,6 +10,7 @@ import xarray as xr
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -117,7 +118,7 @@ def prepare_training(ds_train, horizon):
     scalers = {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
     return Xw, Yw, Din, A, scalers
 
-def train_model(X, Y, Din, A, horizon):
+def train_model(X, Y, Din, A, horizon, eval_callback=None):
     if len(X) == 0:
         return None
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
@@ -141,6 +142,8 @@ def train_model(X, Y, Din, A, horizon):
             epoch_loss += loss.item() * xb.size(0)
         epoch_loss /= len(dl.dataset)
         print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f}")
+        if eval_callback is not None:
+            eval_callback(model, epoch + 1)
     return model
 
 @torch.no_grad()
@@ -161,6 +164,14 @@ def predict_future(ds_train, model, scalers, A, horizon, ts_future):
         rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred[li]}))
     return pd.concat(rows, ignore_index=True)
 
+def make_eval_callback(ds_train, scalers, A, horizon, ts_future, df_truth):
+    """Return a callback that evaluates the model after each epoch."""
+    def _callback(model, epoch):
+        df_pred = predict_future(ds_train, model, scalers, A, horizon, ts_future)
+        rmse = per_county_rmse_mean(df_truth, df_pred)
+        print(f"[Eval] Epoch {epoch}: RMSE={rmse:.4f}")
+    return _callback
+
 # ---------------- main ----------------
 def main():
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
@@ -168,8 +179,12 @@ def main():
     ts24 = pd.to_datetime(ds_test24.timestamp.values)
     horizon = len(ts24)
 
+    # Truth data for evaluation
+    df_truth = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+
     X, Y, Din, A, scalers = prepare_training(ds_train, horizon)
-    model = train_model(X, Y, Din, A, horizon)
+    eval_cb = make_eval_callback(ds_train, scalers, A, horizon, ts24, df_truth)
+    model = train_model(X, Y, Din, A, horizon, eval_callback=eval_cb)
 
     if model is not None:
         df = predict_future(ds_train, model, scalers, A.to(DEVICE), horizon, ts24)
