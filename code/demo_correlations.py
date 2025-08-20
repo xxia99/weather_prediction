@@ -28,9 +28,16 @@ def plot_spatial_corr(df: pd.DataFrame, title: str, out_path: str) -> None:
 def plot_outage_trends(df: pd.DataFrame, out_path: str) -> None:
     """Plot hourly outage counts for every location."""
     nloc = df.shape[1]
-    ncols = 10
+    # choose a nearly square grid for 83 locations
+    ncols = math.ceil(math.sqrt(nloc))
     nrows = math.ceil(nloc / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2 * ncols, 1.5 * nrows), sharex=True, sharey=True)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(2 * ncols, 1.5 * nrows),
+        sharex=True,
+        sharey=True,
+    )
     axes = axes.flatten()
     for i, col in enumerate(df.columns):
         axes[i].plot(df.index, df[col])
