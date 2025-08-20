@@ -40,10 +40,18 @@ def zapply(arr, mu, sd):
     return (arr - mu) / sd
 
 def build_corr_adjacency(y, k=5):
-    """Build adjacency from pairwise outage correlations."""
+    """Build a normalized adjacency from pairwise outage correlations.
+
+    Negative correlations and NaNs are clipped to zero so that the graph
+    normalization step does not produce infinities or NaNs when computing the
+    degree matrix.
+    """
     L = y.shape[1]
     corr = np.corrcoef(y.T)
+    corr = np.nan_to_num(corr, nan=0.0)
     np.fill_diagonal(corr, 0.0)
+    corr[corr < 0] = 0.0
+
     A = np.zeros((L, L), dtype=float)
     for i in range(L):
         idx = np.argsort(-corr[i])[:k]
@@ -51,8 +59,7 @@ def build_corr_adjacency(y, k=5):
     A = np.maximum(A, A.T)
     A = A + np.eye(L)
     d = A.sum(axis=1)
-    d = np.where(d == 0, 1.0, d)
-    D_inv_sqrt = np.diag(1.0 / np.sqrt(d))
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(d + 1e-6))
     A_norm = D_inv_sqrt @ A @ D_inv_sqrt
     return torch.tensor(A_norm, dtype=torch.float32)
 
@@ -63,7 +70,7 @@ def build_windows(X, y, seq_len, horizon):
     Xw, Yw = [], []
     for i in range(N):
         Xw.append(X[i:i+seq_len])           # (seq_len, L, F)
-        Yw.append(y[i+seq_len:i+seq_len+horizon])  # (horizon, L)
+        Yw.append(y[i+seq_len:i+seq_len+horizon].T)  # (L, horizon)
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
 # ---------------- model ----------------
