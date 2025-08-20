@@ -11,13 +11,13 @@ from math import sqrt
 
 SPLIT_DIR = "data/"
 
-PRED_DIR  = "results/"
-PRED_24 = os.path.join(PRED_DIR, "sarimax_pred_24h.csv")  # change if your per-county filename differs
-PRED_48 = os.path.join(PRED_DIR, "sarimax_pred_48h.csv")  # change if your per-county filename differs
+# PRED_DIR  = "results/"
+# PRED_24 = os.path.join(PRED_DIR, "sarimax_pred_24h.csv")  # change if your per-county filename differs
+# PRED_48 = os.path.join(PRED_DIR, "sarimax_pred_48h.csv")  # change if your per-county filename differs
 
-# PRED_DIR  = "results_seq/"
-# PRED_24 = os.path.join(PRED_DIR, "seq2seq_pred_24h.csv")  # change if your per-county filename differs
-# PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")  # change if your per-county filename differs
+PRED_DIR  = "results_seq/"
+PRED_24 = os.path.join(PRED_DIR, "seq2seq_pred_24h.csv")  # change if your per-county filename differs
+PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")  # change if your per-county filename differs
 
 def rmse(y, p) -> float:
     y = np.asarray(y, dtype=float)
