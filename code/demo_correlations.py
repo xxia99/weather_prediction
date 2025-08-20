@@ -3,6 +3,7 @@ import pandas as pd
 import xarray as xr
 import seaborn as sns
 import matplotlib.pyplot as plt
+import math
 
 SPLIT_DIR = "data/"
 OUT_DIR = "results_vis/"
@@ -19,6 +20,38 @@ def plot_spatial_corr(df: pd.DataFrame, title: str, out_path: str) -> None:
     plt.figure(figsize=(10, 8))
     sns.heatmap(df.corr(), cmap="coolwarm", center=0)
     plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_outage_trends(df: pd.DataFrame, out_path: str) -> None:
+    """Plot hourly outage counts for every location."""
+    nloc = df.shape[1]
+    ncols = 10
+    nrows = math.ceil(nloc / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2 * ncols, 1.5 * nrows), sharex=True, sharey=True)
+    axes = axes.flatten()
+    for i, col in enumerate(df.columns):
+        axes[i].plot(df.index, df[col])
+        axes[i].set_title(str(col), fontsize=8)
+        axes[i].tick_params(labelsize=6)
+    for j in range(i + 1, len(axes)):
+        axes[j].axis("off")
+    fig.suptitle("Temporal trends of outage counts per location", fontsize=12)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_feature_corr(ds: xr.Dataset, out_path: str) -> None:
+    """Plot correlation matrix among all weather features."""
+    w = ds.weather.transpose("timestamp", "location", "feature").values
+    F = w.shape[-1]
+    df = pd.DataFrame(w.reshape(-1, F), columns=ds.weather.feature.values)
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(df.corr(), cmap="coolwarm", center=0, xticklabels=True, yticklabels=True)
+    plt.title("Correlation among weather features")
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
@@ -45,6 +78,10 @@ def main() -> None:
         "Spatial correlation of outage counts",
         os.path.join(OUT_DIR, "spatial_outage.png"),
     )
+    plot_outage_trends(
+        out_df,
+        os.path.join(OUT_DIR, "outage_trends.png"),
+    )
     plot_temporal_autocorr(
         pd.Series(out_df.values.reshape(-1)),
         48,
@@ -67,6 +104,11 @@ def main() -> None:
             "Temporal autocorrelation of 2m temperature",
             os.path.join(OUT_DIR, "temporal_t2m.png"),
         )
+
+    plot_feature_corr(
+        ds,
+        os.path.join(OUT_DIR, "feature_corr.png"),
+    )
 
     ds.close()
     print(f"Saved figures to {OUT_DIR}")
