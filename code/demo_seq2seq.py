@@ -13,6 +13,7 @@ import xarray as xr
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -74,7 +75,7 @@ class SimpleSeq2Seq(nn.Module):
         hlast = h[-1]               # (B, dh)
         return self.head(hlast)     # (B, H)
 
-def train_model(X, Y, din, horizon):
+def train_model(X, Y, din, horizon, eval_callback=None):
     if len(X) == 0:
         return None
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
@@ -101,6 +102,8 @@ def train_model(X, Y, din, horizon):
         epoch_loss /= len(dl.dataset)
         elapsed = time.time() - start_time
         print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s")
+        if eval_callback is not None:
+            eval_callback(model, epoch + 1)
 
     return model
 
@@ -183,6 +186,15 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
 
     return pd.concat(rows, ignore_index=True)
 
+
+def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
+    """Return a callback that evaluates the model after each epoch."""
+    def _callback(model, epoch):
+        df_pred = predict_per_county(ds_train, model, scalers, horizon, ts_future)
+        rmse = per_county_rmse_mean(df_truth, df_pred)
+        print(f"[Eval {label}] Epoch {epoch}: RMSE={rmse:.4f}")
+    return _callback
+
 # ---------------- main ----------------
 def main():
     # Load train + test
@@ -200,12 +212,18 @@ def main():
     ts48 = pd.to_datetime(ds_test48.timestamp.values)
     H24, H48 = len(ts24), len(ts48)
 
+    # Truth data for evaluation
+    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+
     # Train two shared models (one per horizon), using all counties' windows
     X24, Y24, Din, scalers24 = prepare_training(ds_train, horizon=H24)
-    mdl24 = train_model(X24, Y24, Din, H24)
+    eval_cb24 = make_eval_callback(ds_train, scalers24, H24, ts24, df_t24, "24h")
+    mdl24 = train_model(X24, Y24, Din, H24, eval_callback=eval_cb24)
 
     X48, Y48, _, scalers48 = prepare_training(ds_train, horizon=H48)
-    mdl48 = train_model(X48, Y48, Din, H48)
+    eval_cb48 = make_eval_callback(ds_train, scalers48, H48, ts48, df_t48, "48h")
+    mdl48 = train_model(X48, Y48, Din, H48, eval_callback=eval_cb48)
 
     # Predict per county
     df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
