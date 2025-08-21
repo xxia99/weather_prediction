@@ -95,10 +95,8 @@ def per_county_rmse_mean(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
         else:
             yp = np.zeros_like(yt)
         # print("yp shape:", yp.shape)
-        # softmax predictions to [0, 1] and clip NaNs
-        from scipy.special import softmax
-        yp = softmax(yp, axis=0)
-        # yp = np.clip(np.nan_to_num(yp, nan=0.0, posinf=None, neginf=0.0), 0.0, 1)
+        # Clip NaNs and negatives; evaluate on raw counts
+        yp = np.clip(np.nan_to_num(yp, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
         rmses.append(rmse(yt, yp))
     return float(np.mean(rmses)) if rmses else float("nan")
 
