@@ -146,7 +146,9 @@ def prepare_train_val(ds, horizon, val_days=VAL_DAYS):
 
     Validation uses the last ``val_days`` of the training range. Scaling is
     computed on the training portion only but applied to the entire dataset so
-    that validation windows can leverage history from the training period.
+    that validation windows can leverage history from the training period. Any
+    window whose prediction horizon straddles the train/validation boundary is
+    discarded to avoid leakage.
     """
     y = ds.out.transpose("timestamp", "location").values.astype(float)                 # (T, L)
     w = ds.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, L, F)
@@ -177,14 +179,20 @@ def prepare_train_val(ds, horizon, val_days=VAL_DAYS):
         for i in range(N):
             start = i
             forecast_start = i + SEQ_LEN
+            forecast_end = forecast_start + horizon
             Xw = X_loc[start:start + SEQ_LEN]
-            Yw = y_loc[forecast_start:forecast_start + horizon]
-            if forecast_start < val_start:
+            Yw = y_loc[forecast_start:forecast_end]
+
+            # Assign to train or validation ensuring no horizon overlap
+            if forecast_end <= val_start:
                 X_tr.append(Xw)
                 Y_tr.append(Yw)
-            else:
+            elif forecast_start >= val_start:
                 X_val.append(Xw)
                 Y_val.append(Yw)
+            else:
+                # Window crosses the boundary; skip to prevent leakage
+                continue
 
     Xtr = np.asarray(X_tr, dtype=float) if X_tr else np.empty((0, SEQ_LEN, Din), dtype=float)
     Ytr = np.asarray(Y_tr, dtype=float) if Y_tr else np.empty((0, horizon), dtype=float)
