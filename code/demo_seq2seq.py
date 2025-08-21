@@ -13,6 +13,7 @@ import xarray as xr
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from demo_evaluate import per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -48,21 +49,6 @@ def zfit(arr):
 def zapply(arr, mu, sd):
     return (arr - mu) / sd
 
-def build_windows(X_loc, y_loc, seq_len, horizon):
-    """
-    Build (X,y) windows for one location.
-    X_loc: (T, D), y_loc: (T,)
-    Returns Xw: (N, seq_len, D), Yw: (N, horizon)
-    """
-    N = len(y_loc) - seq_len - horizon + 1
-    if N <= 0:
-        return np.empty((0, seq_len, X_loc.shape[1]), dtype=float), np.empty((0, horizon), dtype=float)
-    Xw, Yw = [], []
-    for i in range(N):
-        Xw.append(X_loc[i:i+seq_len])
-        Yw.append(y_loc[i+seq_len:i+seq_len+horizon])
-    return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
-
 # ---------------- model ----------------
 class SimpleSeq2Seq(nn.Module):
     def __init__(self, din, dh=64, nl=1, horizon=24):
@@ -75,7 +61,7 @@ class SimpleSeq2Seq(nn.Module):
         hlast = h[-1]               # (B, dh)
         return self.head(hlast)     # (B, H)
 
-def train_model(Xtr, Ytr, Xval, Yval, din, horizon):
+def train_model(Xtr, Ytr, din, horizon, scalers, val_data=None):
     """Train the Seq2Seq model and report validation RMSE after each epoch."""
     if len(Xtr) == 0:
         return None
@@ -83,12 +69,6 @@ def train_model(Xtr, Ytr, Xval, Yval, din, horizon):
     ds_tr = TensorDataset(torch.tensor(Xtr, dtype=torch.float32),
                           torch.tensor(Ytr, dtype=torch.float32))
     dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True)
-
-    dl_val = None
-    if len(Xval) > 0:
-        ds_val = TensorDataset(torch.tensor(Xval, dtype=torch.float32),
-                               torch.tensor(Yval, dtype=torch.float32))
-        dl_val = DataLoader(ds_val, batch_size=BATCH_SIZE)
 
     model = SimpleSeq2Seq(din=din, dh=DHIDDEN, nl=NLAYERS, horizon=horizon).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
@@ -111,20 +91,21 @@ def train_model(Xtr, Ytr, Xval, Yval, din, horizon):
         epoch_loss /= len(dl_tr.dataset)
 
         val_rmse = float("nan")
-        if dl_val is not None:
+        if val_data is not None:
             model.eval()
-            val_loss = 0.0
-            n = 0
-            for xb, yb in dl_val:
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                with torch.no_grad():
-                    pred = model(xb)
-                    loss = loss_fn(pred, yb)
-                val_loss += loss.item() * xb.size(0)
-                n += xb.size(0)
-            if n > 0:
-                val_loss /= n
-                val_rmse = float(np.sqrt(val_loss))
+            Xin = torch.tensor(val_data["Xin"], dtype=torch.float32).to(DEVICE)
+            with torch.no_grad():
+                pred_sc = model(Xin).cpu().numpy()  # (L, H)
+            pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
+            pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+
+            ts = val_data["ts"]
+            locs = val_data["locs"]
+            rows = []
+            for li, county in enumerate(locs):
+                rows.append(pd.DataFrame({"timestamp": ts, "location": county, "pred": pred[li].astype(float)}))
+            df_pred = pd.concat(rows, ignore_index=True)
+            val_rmse = per_county_rmse_mean(val_data["truth"], df_pred)
 
         elapsed = time.time() - start_time
         if np.isnan(val_rmse):
@@ -142,16 +123,16 @@ def infer(model, Xin):
 
 # ---------------- pipeline helpers ----------------
 def prepare_train_val(ds, horizon, val_days=VAL_DAYS):
-    """Split dataset into train/validation and build windows.
+    """Split dataset into training windows and validation helpers.
 
-    Validation uses the last ``val_days`` of the training range. Scaling is
-    computed on the training portion only but applied to the entire dataset so
-    that validation windows can leverage history from the training period. Any
-    window whose prediction horizon straddles the train/validation boundary is
-    discarded to avoid leakage.
+    The last ``val_days`` of the series are reserved for validation. Scaling is
+    fit on the training portion only. Validation metrics will forecast the first
+    ``horizon`` hours of the held-out range using the final ``SEQ_LEN`` hours of
+    history preceding it.
     """
     y = ds.out.transpose("timestamp", "location").values.astype(float)                 # (T, L)
     w = ds.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, L, F)
+    ts = pd.to_datetime(ds.timestamp.values)
     T, L, F = w.shape
 
     val_hours = val_days * 24
@@ -161,45 +142,45 @@ def prepare_train_val(ds, horizon, val_days=VAL_DAYS):
     y_mu, y_sd = zfit(y[:val_start].reshape(-1, 1))
     w_mu, w_sd = zfit(w[:val_start].reshape(-1, F))
 
-    # Scale entire arrays so validation windows can draw on full history
+    # Scale entire arrays
     y_sc = zapply(y.reshape(-1, 1), y_mu, y_sd).reshape(T, L)
     w_sc = zapply(w.reshape(-1, F), w_mu, w_sd).reshape(T, L, F)
 
     Din = 1 + F
-    X_tr, Y_tr, X_val, Y_val = [], [], [], []
-
-    for li in range(L):
-        y_loc = y_sc[:, li]
-        w_loc = w_sc[:, li, :]
-        X_loc = np.concatenate([y_loc.reshape(-1, 1), w_loc], axis=1)
-        T_loc = len(y_loc)
-        N = T_loc - SEQ_LEN - horizon + 1
-        if N <= 0:
-            continue
-        for i in range(N):
-            start = i
-            forecast_start = i + SEQ_LEN
-            forecast_end = forecast_start + horizon
-            Xw = X_loc[start:start + SEQ_LEN]
-            Yw = y_loc[forecast_start:forecast_end]
-
-            # Assign to train or validation ensuring no horizon overlap
-            if forecast_end <= val_start:
-                X_tr.append(Xw)
-                Y_tr.append(Yw)
-            elif forecast_start >= val_start:
-                X_val.append(Xw)
-                Y_val.append(Yw)
-            else:
-                # Window crosses the boundary; skip to prevent leakage
-                continue
+    N = val_start - SEQ_LEN - horizon + 1
+    X_tr, Y_tr = [], []
+    if N > 0:
+        for li in range(L):
+            y_loc = y_sc[:, li]
+            w_loc = w_sc[:, li, :]
+            X_loc = np.concatenate([y_loc.reshape(-1, 1), w_loc], axis=1)
+            for i in range(N):
+                X_tr.append(X_loc[i:i + SEQ_LEN])
+                Y_tr.append(y_loc[i + SEQ_LEN:i + SEQ_LEN + horizon])
 
     Xtr = np.asarray(X_tr, dtype=float) if X_tr else np.empty((0, SEQ_LEN, Din), dtype=float)
     Ytr = np.asarray(Y_tr, dtype=float) if Y_tr else np.empty((0, horizon), dtype=float)
-    Xval = np.asarray(X_val, dtype=float) if X_val else np.empty((0, SEQ_LEN, Din), dtype=float)
-    Yval = np.asarray(Y_val, dtype=float) if Y_val else np.empty((0, horizon), dtype=float)
+
+    # Precompute validation helpers
+    ts_val = ts[val_start:val_start + horizon]
+    locs = list(map(str, ds.location.values))
+    y_val = y[val_start:val_start + horizon]
+    df_truth = pd.DataFrame(y_val, columns=locs)
+    df_truth.insert(0, "timestamp", ts_val)
+
+    Xin = []
+    for li in range(L):
+        X_loc = np.concatenate([y_sc[:, li].reshape(-1, 1), w_sc[:, li, :]], axis=1)
+        hist = X_loc[max(0, val_start - SEQ_LEN):val_start]
+        if hist.shape[0] < SEQ_LEN:
+            pad = np.zeros((SEQ_LEN - hist.shape[0], Din))
+            hist = np.concatenate([pad, hist], axis=0)
+        Xin.append(hist)
+    Xin = np.asarray(Xin, dtype=float)  # (L, SEQ_LEN, Din)
+
     scalers = {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
-    return Xtr, Ytr, Xval, Yval, Din, scalers
+    val_data = {"Xin": Xin, "ts": ts_val, "truth": df_truth, "locs": locs}
+    return Xtr, Ytr, Din, scalers, val_data
 
 def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     """
@@ -257,11 +238,11 @@ def main():
     H24, H48 = len(ts24), len(ts48)
 
     # Prepare train/val windows and train models
-    X24_tr, Y24_tr, X24_val, Y24_val, Din, scalers24 = prepare_train_val(ds_train, horizon=H24)
-    mdl24 = train_model(X24_tr, Y24_tr, X24_val, Y24_val, Din, H24)
+    X24_tr, Y24_tr, Din, scalers24, val24 = prepare_train_val(ds_train, horizon=H24)
+    mdl24 = train_model(X24_tr, Y24_tr, Din, H24, scalers24, val_data=val24)
 
-    X48_tr, Y48_tr, X48_val, Y48_val, _, scalers48 = prepare_train_val(ds_train, horizon=H48)
-    mdl48 = train_model(X48_tr, Y48_tr, X48_val, Y48_val, Din, H48)
+    X48_tr, Y48_tr, Din, scalers48, val48 = prepare_train_val(ds_train, horizon=H48)
+    mdl48 = train_model(X48_tr, Y48_tr, Din, H48, scalers48, val_data=val48)
 
     # Predict per county
     df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
