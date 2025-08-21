@@ -20,13 +20,13 @@ SPLIT_DIR = "data/"
 OUT_DIR   = "results_seq/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-SEQ_LEN    = 24
+SEQ_LEN    = 48
 BATCH_SIZE = 64
 EPOCHS     = 5
-LR         = 1e-3
+LR         = 1e-4
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-DHIDDEN    = 64
-NLAYERS    = 1
+DHIDDEN    = 32
+NLAYERS    = 5
 
 # ---------------- utils ----------------
 def open_ds(path):
@@ -202,7 +202,7 @@ def main():
     # ds_test24 = open_ds(os.path.join(SPLIT_DIR, "test_24h.nc"))
     # ds_test48 = open_ds(os.path.join(SPLIT_DIR, "test_48h.nc"))
     ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
     # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_10days.nc"))
     # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
@@ -216,7 +216,7 @@ def main():
 
     # Truth data for evaluation
     df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
 
     # Train two shared models (one per horizon), using all counties' windows
     X24, Y24, Din, scalers24 = prepare_training(ds_train, horizon=H24)
