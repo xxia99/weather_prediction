@@ -198,11 +198,13 @@ def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
 # ---------------- main ----------------
 def main():
     # Load train + test
-    ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
+    ds_train = open_ds(os.path.join(SPLIT_DIR, "train_10days.nc"))
     # ds_test24 = open_ds(os.path.join(SPLIT_DIR, "test_24h.nc"))
     # ds_test48 = open_ds(os.path.join(SPLIT_DIR, "test_48h.nc"))
-    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_10days.nc"))
+    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
     # Ensure features exist (and implicitly use all of them)
     _ = get_all_features(ds_train)
@@ -213,7 +215,7 @@ def main():
     H24, H48 = len(ts24), len(ts48)
 
     # Truth data for evaluation
-    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
     df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
     # Train two shared models (one per horizon), using all counties' windows
@@ -221,35 +223,35 @@ def main():
     eval_cb24 = make_eval_callback(ds_train, scalers24, H24, ts24, df_t24, "24h")
     mdl24 = train_model(X24, Y24, Din, H24, eval_callback=eval_cb24)
 
-    X48, Y48, _, scalers48 = prepare_training(ds_train, horizon=H48)
-    eval_cb48 = make_eval_callback(ds_train, scalers48, H48, ts48, df_t48, "48h")
-    mdl48 = train_model(X48, Y48, Din, H48, eval_callback=eval_cb48)
-
-    # Predict per county
-    df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
-    df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48) if mdl48 is not None else None
-
-    # Fallback to zeros if no windows (extremely short train)
-    if df24 is None:
-        locs = list(map(str, ds_train.location.values))
-        df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
-                             "location": np.tile(locs, len(ts24)),
-                             "pred": 0.0})
-    if df48 is None:
-        locs = list(map(str, ds_train.location.values))
-        df48 = pd.DataFrame({"timestamp": np.repeat(ts48, len(locs)),
-                             "location": np.tile(locs, len(ts48)),
-                             "pred": 0.0})
-
-    # Save 
-    out24 = os.path.join(OUT_DIR, "seq2seq_pred_24h.csv")
-    out48 = os.path.join(OUT_DIR, "seq2seq_pred_48h.csv")
-    df24.to_csv(out24, index=False)
-    df48.to_csv(out48, index=False)
-
-    print("Saved predictions:")
-    print(f"  {out24}")
-    print(f"  {out48}")
+    # X48, Y48, _, scalers48 = prepare_training(ds_train, horizon=H48)
+    # eval_cb48 = make_eval_callback(ds_train, scalers48, H48, ts48, df_t48, "48h")
+    # mdl48 = train_model(X48, Y48, Din, H48, eval_callback=eval_cb48)
+    #
+    # # Predict per county
+    # df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
+    # df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48) if mdl48 is not None else None
+    #
+    # # Fallback to zeros if no windows (extremely short train)
+    # if df24 is None:
+    #     locs = list(map(str, ds_train.location.values))
+    #     df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
+    #                          "location": np.tile(locs, len(ts24)),
+    #                          "pred": 0.0})
+    # if df48 is None:
+    #     locs = list(map(str, ds_train.location.values))
+    #     df48 = pd.DataFrame({"timestamp": np.repeat(ts48, len(locs)),
+    #                          "location": np.tile(locs, len(ts48)),
+    #                          "pred": 0.0})
+    #
+    # # Save
+    # out24 = os.path.join(OUT_DIR, "seq2seq_pred_24h.csv")
+    # out48 = os.path.join(OUT_DIR, "seq2seq_pred_48h.csv")
+    # df24.to_csv(out24, index=False)
+    # df48.to_csv(out48, index=False)
+    #
+    # print("Saved predictions:")
+    # print(f"  {out24}")
+    # print(f"  {out48}")
 
     # Clean up
     ds_train.close(); ds_test24.close(); ds_test48.close()
