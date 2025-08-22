@@ -29,6 +29,8 @@ def main():
     # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h.nc"))
     ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
+    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
 
     counties = list(ds_train.location.values)
     ts24 = pd.to_datetime(ds_test24.timestamp.values)

@@ -10,6 +10,7 @@ import numpy as np
 import time
 import pandas as pd
 import xarray as xr
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -20,19 +21,22 @@ SPLIT_DIR = "data/"
 OUT_DIR   = "results_seq/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-SEQ_LEN    = 48
+SEQ_LEN    = 24
 BATCH_SIZE = 64
-EPOCHS     = 5
-LR         = 1e-4
+EPOCHS     = 20
+LR         = 1e-3
+WEIGHT_DECAY = 1e-4
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-DHIDDEN    = 32
-NLAYERS    = 5
+D_MODEL    = 128
+NHEAD      = 8
+NLAYERS    = 2
+DROPOUT    = 0.1
 
 # ---------------- utils ----------------
 def open_ds(path):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    return xr.open_dataset(path)
+    return xr.open_dataset(path, engine="netcdf4")
 
 def get_all_features(ds):
     if "feature" not in ds.dims:
@@ -63,17 +67,40 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
         Yw.append(y_loc[i+seq_len:i+seq_len+horizon])
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
-# ---------------- model ----------------
-class SimpleSeq2Seq(nn.Module):
-    def __init__(self, din, dh=64, nl=1, horizon=24):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
-        self.lstm = nn.LSTM(din, dh, nl, batch_first=True)
-        self.head = nn.Linear(dh, horizon)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)  # (max_len, 1, d_model)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (T, B, d_model)
+        return x + self.pe[:x.size(0)]
+
+
+class TransformerForecaster(nn.Module):
+    def __init__(self, din, horizon):
+        super().__init__()
+        self.input_proj = nn.Linear(din, D_MODEL)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=NHEAD, dim_feedforward=256, dropout=DROPOUT, batch_first=False)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=NLAYERS)
+        self.pos_encoder = PositionalEncoding(D_MODEL)
+        self.head = nn.Linear(D_MODEL, horizon)
+
     def forward(self, x):
         # x: (B, T, D)
-        _, (h, _) = self.lstm(x)
-        hlast = h[-1]               # (B, dh)
-        return self.head(hlast)     # (B, H)
+        x = self.input_proj(x)            # (B, T, D_MODEL)
+        x = x.transpose(0, 1)             # (T, B, D_MODEL)
+        x = self.pos_encoder(x)
+        enc = self.encoder(x)             # (T, B, D_MODEL)
+        last = enc[-1]                    # (B, D_MODEL)
+        return self.head(last)            # (B, horizon)
+
 
 def train_model(X, Y, din, horizon, eval_callback=None):
     if len(X) == 0:
@@ -81,8 +108,8 @@ def train_model(X, Y, din, horizon, eval_callback=None):
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
                        torch.tensor(Y, dtype=torch.float32))
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
-    model = SimpleSeq2Seq(din=din, dh=DHIDDEN, nl=NLAYERS, horizon=horizon).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    model = TransformerForecaster(din=din, horizon=horizon).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     loss_fn = nn.MSELoss()
 
     for epoch in range(EPOCHS):
@@ -198,13 +225,15 @@ def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
 # ---------------- main ----------------
 def main():
     # Load train + test
-    ds_train = open_ds(os.path.join(SPLIT_DIR, "train_10days.nc"))
+    ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
+    # ds_train = open_ds(os.path.join(SPLIT_DIR, "train_50days.nc"))
+
     # ds_test24 = open_ds(os.path.join(SPLIT_DIR, "test_24h.nc"))
     # ds_test48 = open_ds(os.path.join(SPLIT_DIR, "test_48h.nc"))
-    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_10days.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
+    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
     # Ensure features exist (and implicitly use all of them)
     _ = get_all_features(ds_train)
@@ -215,43 +244,45 @@ def main():
     H24, H48 = len(ts24), len(ts48)
 
     # Truth data for evaluation
-    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    # df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
+    # df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
+    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
     # Train two shared models (one per horizon), using all counties' windows
     X24, Y24, Din, scalers24 = prepare_training(ds_train, horizon=H24)
     eval_cb24 = make_eval_callback(ds_train, scalers24, H24, ts24, df_t24, "24h")
     mdl24 = train_model(X24, Y24, Din, H24, eval_callback=eval_cb24)
 
-    # X48, Y48, _, scalers48 = prepare_training(ds_train, horizon=H48)
-    # eval_cb48 = make_eval_callback(ds_train, scalers48, H48, ts48, df_t48, "48h")
-    # mdl48 = train_model(X48, Y48, Din, H48, eval_callback=eval_cb48)
-    #
-    # # Predict per county
-    # df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
-    # df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48) if mdl48 is not None else None
-    #
-    # # Fallback to zeros if no windows (extremely short train)
-    # if df24 is None:
-    #     locs = list(map(str, ds_train.location.values))
-    #     df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
-    #                          "location": np.tile(locs, len(ts24)),
-    #                          "pred": 0.0})
-    # if df48 is None:
-    #     locs = list(map(str, ds_train.location.values))
-    #     df48 = pd.DataFrame({"timestamp": np.repeat(ts48, len(locs)),
-    #                          "location": np.tile(locs, len(ts48)),
-    #                          "pred": 0.0})
-    #
-    # # Save
-    # out24 = os.path.join(OUT_DIR, "seq2seq_pred_24h.csv")
-    # out48 = os.path.join(OUT_DIR, "seq2seq_pred_48h.csv")
-    # df24.to_csv(out24, index=False)
-    # df48.to_csv(out48, index=False)
-    #
-    # print("Saved predictions:")
-    # print(f"  {out24}")
-    # print(f"  {out48}")
+    X48, Y48, _, scalers48 = prepare_training(ds_train, horizon=H48)
+    eval_cb48 = make_eval_callback(ds_train, scalers48, H48, ts48, df_t48, "48h")
+    mdl48 = train_model(X48, Y48, Din, H48, eval_callback=eval_cb48)
+
+    # Predict per county
+    df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24) if mdl24 is not None else None
+    df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48) if mdl48 is not None else None
+
+    # Fallback to zeros if no windows (extremely short train)
+    if df24 is None:
+        locs = list(map(str, ds_train.location.values))
+        df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
+                             "location": np.tile(locs, len(ts24)),
+                             "pred": 0.0})
+    if df48 is None:
+        locs = list(map(str, ds_train.location.values))
+        df48 = pd.DataFrame({"timestamp": np.repeat(ts48, len(locs)),
+                             "location": np.tile(locs, len(ts48)),
+                             "pred": 0.0})
+
+    # Save
+    out24 = os.path.join(OUT_DIR, "seq2seq_pred_24h.csv")
+    out48 = os.path.join(OUT_DIR, "seq2seq_pred_48h.csv")
+    df24.to_csv(out24, index=False)
+    df48.to_csv(out48, index=False)
+
+    print("Saved predictions:")
+    print(f"  {out24}")
+    print(f"  {out48}")
 
     # Clean up
     ds_train.close(); ds_test24.close(); ds_test48.close()

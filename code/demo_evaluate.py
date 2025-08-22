@@ -11,13 +11,24 @@ from math import sqrt
 
 SPLIT_DIR = "data/"
 
-# PRED_DIR  = "results/"
-# PRED_24 = os.path.join(PRED_DIR, "sarimax_pred_24h.csv")  # change if your per-county filename differs
-# PRED_48 = os.path.join(PRED_DIR, "sarimax_pred_48h.csv")  # change if your per-county filename differs
+PRED_DIR  = "results/"
+PRED_24 = os.path.join(PRED_DIR, "sarimax_pred_24h.csv")  # change if your per-county filename differs
+PRED_48 = os.path.join(PRED_DIR, "sarimax_pred_48h.csv")  # change if your per-county filename differs
 
-PRED_DIR  = "results_seq/"
-PRED_24 = os.path.join(PRED_DIR, "seq2seq_pred_24h.csv")  # change if your per-county filename differs
-PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")  # change if your per-county filename differs
+# PRED_DIR  = "results_seq/"
+# PRED_24 = os.path.join(PRED_DIR, "seq2seq_pred_24h.csv")  # change if your per-county filename differs
+# PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")  # change if your per-county filename differs
+# PRED_24 = os.path.join(PRED_DIR, "stgnn_pred_24h.csv")  # change if your per-county filename differs
+# PRED_48 = os.path.join(PRED_DIR, "stgnn_pred_48h.csv")  # change if your per-county filename differs
+# PRED_24 = os.path.join(PRED_DIR, "stemgnn_pred_24h.csv")  # change if your per-county filename differs
+# PRED_48 = os.path.join(PRED_DIR, "stemgnn_pred_48h.csv")
+# PRED_DIR  = "results_stemgnn/"
+# PRED_24 = os.path.join(PRED_DIR, "stemgnn_pred_24h.csv")  # change if your per-county filename differs
+# PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")
+#
+# PRED_DIR  = "results_stgnn/"
+# PRED_24 = os.path.join(PRED_DIR, "stgnn_pred_24h.csv")  # change if your per-county filename differs
+# # PRED_48 = os.path.join(PRED_DIR, "seq2seq_pred_48h.csv")
 
 def rmse(y, p) -> float:
     y = np.asarray(y, dtype=float)
@@ -94,11 +105,13 @@ def per_county_rmse_mean(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
             yp = df[f"{loc}_pred"].values
         else:
             yp = np.zeros_like(yt)
-        # print("yp shape:", yp.shape)
-        # softmax predictions to [0, 1] and clip NaNs
-        from scipy.special import softmax
-        yp = softmax(yp, axis=0)
-        # yp = np.clip(np.nan_to_num(yp, nan=0.0, posinf=None, neginf=0.0), 0.0, 1)
+        # Normalize
+        if yt.max() <= 1:
+            if yp.max() > yp.min():
+                yp = (yp - yp.min()) / (yp.max() - yp.min())
+            else:
+                yp = np.zeros_like(yp)  # all values are the same
+
         rmses.append(rmse(yt, yp))
     return float(np.mean(rmses)) if rmses else float("nan")
 
@@ -110,7 +123,7 @@ def zero_baseline_rmse(df_truth_wide: pd.DataFrame) -> float:
     rmses = []
     for loc in locs:
         y = df_truth_wide[loc].values
-        p = np.zeros_like(y, dtype=float)
+        p = np.ones_like(y, dtype=float)
         rmses.append(rmse(y, p))
     return float(np.mean(rmses))
 
@@ -118,6 +131,8 @@ def main():
     # Prefer demo tests; fall back to real tests if demos missing
     t24 = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
     t48 = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    # t24 = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    # t48 = os.path.join(SPLIT_DIR, "valid_2days.nc")
     if not os.path.exists(t24):
         t24 = os.path.join(SPLIT_DIR, "test_24h.nc")
     if not os.path.exists(t48):
