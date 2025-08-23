@@ -3,14 +3,12 @@ import time
 from math import ceil
 from tqdm import tqdm
 import numpy as np
-import pandas as pd
+import pandas as pd  # <-- added
 import xarray as xr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-import torch.distributed as dist
-from datetime import timedelta
 
 # =========================
 # Config
@@ -19,16 +17,15 @@ SPLIT_DIR   = "data/"
 OUT_DIR     = "results_seq/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- NEW: choose GPU ids to use (optional). Leave [] to respect env.
-GPU_IDS = []  # e.g., [0,1,2]; [] -> use CUDA_VISIBLE_DEVICES as-is
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 # Windows / data
 SEQ_LEN     = 24     # context length T (match downstream)
 H_PRE       = 24     # pretraining forecast horizon H
-BATCH_SIZE  = 128     # global batch size across all GPUs
+BATCH_SIZE  = 16
 
 # Training
-EPOCHS          = 20
+EPOCHS          = 100
 LR              = 1e-4
 WEIGHT_DECAY    = 1e-3
 GRAD_CLIP_NORM  = 5.0
@@ -68,57 +65,22 @@ FREQ_SHELF_STRENGTH     = (0.3, 0.8)    # attenuation factor range
 W_SSL       = 1.0   # masked reconstruction loss weight
 W_FORECAST  = 1.0   # next-H forecasting loss weight
 
-# ---------- CB + PEFT (LoRA) ----------
-CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"  # or a local path
-D_OUT           = 64
-LORA_R          = 8
-LORA_ALPHA      = 16
-LORA_DROPOUT    = 0.05
+# ---------- PatchTST encoder hyperparams ----------
+PATCH_LEN      = 2
+PATCH_STRIDE   = None   # None => stride=PATCH_LEN (non-overlap)
+PATCH_D_MODEL  = 64
+PATCH_NHEAD    = 4
+PATCH_NLAYERS  = 2
+PATCH_DROPOUT  = 0.3
+PATCH_FF       = 4 * PATCH_D_MODEL
 
-# ---------- Train/Val split by days ----------
-TRAIN_LAST_DAY = 80  # use days 1..80 for training; 81..end for day-ahead validation
+# ---------- Train/Val split by days (match CB script logic) ----------
+TRAIN_LAST_DAY = 80      # train on days 1..80, validate on the rest
 
-# ---------- Save best metric ----------
+# ---------- Save best metric + path (match CB script behavior) ----------
 # Choose which metric picks the best checkpoint: "loss" or "rmse"
-SAVE_BEST_BY = "loss"
-
-# Save path (wrapper state_dict)
-SAVE_PATH = os.path.join(OUT_DIR, "pretrained_cb_encoder_peft_multitask_contrast_freq.pt")
-# Optional: export LoRA adapter/backbone in HF format
-SAVE_ADAPTER_DIR = os.path.join(OUT_DIR, "cb_peft_adapter_multitask")
-
-# =========================
-# Distributed setup (NEW)
-# =========================
-if GPU_IDS and "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, GPU_IDS))
-
-def setup_distributed():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(hours=2),
-        )
-        return True, rank, world_size, local_rank
-    else:
-        return False, 0, 1, 0
-
-IS_DDP, RANK, WORLD_SIZE, LOCAL_RANK = setup_distributed()
-DEVICE = f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
-
-def is_main_process():
-    return (not IS_DDP) or (RANK == 0)
-
-def ddp_all_reduce(value, op=dist.ReduceOp.SUM):
-    if not IS_DDP:
-        return value
-    tensor = torch.tensor([value], dtype=torch.float64, device=DEVICE)
-    dist.all_reduce(tensor, op=op)
-    return float(tensor.item())
+SAVE_BEST_BY = "rmse"
+SAVE_PATH = os.path.join(OUT_DIR, "pretrained_patchtst_validation.pt")
 
 # =========================
 # Utils
@@ -137,10 +99,18 @@ def zfit(arr):
 def zapply(arr, mu, sd):
     return (arr - mu) / sd
 
+
 # =========================
 # Data prep: windows for SSL + forecasting
 # =========================
 def prepare_multitask_windows(ds_train, seq_len=24, horizon=24):
+    """
+    Returns:
+      X     : (nW, T, N, Din)                      inputs (scaled)
+      Y_fut : (nW, H, N, Din)                      future targets for all channels
+      Din   : 1 (outage) + F (weather)
+      scalers: dict
+    """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
     T, N, F = w.shape
@@ -164,8 +134,9 @@ def prepare_multitask_windows(ds_train, seq_len=24, horizon=24):
     scalers = {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
     return X, Y_fut, Din, scalers
 
+
 # =========================
-# Split helpers
+# Split helpers (copied from CB script, unchanged)
 # =========================
 def _compute_day_indices(ts_np: np.ndarray):
     ts = pd.to_datetime(ts_np)
@@ -188,6 +159,7 @@ def _fit_scalers_train_only(y, w, days, train_last_day):
     return {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
 
 def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last_day=80):
+    """Build train windows using only targets fully within days <= train_last_day. Also return aux for rolling val."""
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
     ts = pd.to_datetime(ds_train.timestamp.values)
@@ -236,6 +208,7 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
     return X_tr, Y_tr, Din, scalers, aux
 
 def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
+    """Validation windows day d -> day d+1, identical to CB script."""
     X_all = aux["X_all_scaled"]           # (T, N, Din)
     ts    = aux["timestamps"]
     days  = aux["days"]
@@ -261,165 +234,75 @@ def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
     Yv = np.stack(Yv, axis=0)  # (nD, horizon, N, Din)
     return Xv, Yv
 
+
 # =========================
-# Chronos-Bolt PEFT encoder
+# PatchTST Encoder
 # =========================
-try:
-    from transformers import AutoModel, AutoConfig
-    HAVE_TRANSFORMERS = True
-except Exception as e:
-    HAVE_TRANSFORMERS = False
-    _transformers_err = str(e)
-
-try:
-    from peft import LoraConfig, get_peft_model
-    HAVE_PEFT = True
-except Exception as e:
-    HAVE_PEFT = False
-    _peft_err = str(e)
-
-def _discover_lora_targets(model: nn.Module):
-    linear_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
-    candidates = [
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "query_key_value", "out_proj", "in_proj",
-        "to_q", "to_k", "to_v", "to_out", "proj_in", "proj_out",
-        "q", "k", "v", "o", "wi", "wo", "wi_0", "wi_1",
-        "Wqkv", "Wo", "Wq", "Wk", "Wv",
-    ]
-    present = [s for s in candidates if any(s in n for n in linear_names)]
-    if not present:
-        attn_linear = [n for n in linear_names if ("attn" in n.lower() or "attention" in n.lower())]
-        if attn_linear:
-            present = list({n.split(".")[-1] for n in attn_linear})
-    if not present:
-        enc_linear = [n for n in linear_names if (".encoder." in n or "encoder.layers" in n or ".layers." in n)]
-        if enc_linear:
-            present = list({n.split(".")[-1] for n in enc_linear})
-    if not present:
-        present = ["linear"]
-    seen, final = set(), []
-    for s in present:
-        if s not in seen:
-            seen.add(s)
-            final.append(s)
-    return final
-
-class ChronosBoltEncoderPEFT(nn.Module):
+class PatchTSTEncoder(nn.Module):
     """
-    Wrap a Chronos/Chronos-Bolt backbone with LoRA (PEFT) and simple
-    input/output adapters to produce (B, T, N, D_OUT) embeddings.
+    Channel-last patching along time for each node independently.
+    Input  : (B, T, N, F)
+    Output : (B, T, N, D)  (token embedding repeated to steps and trimmed)
     """
-    def __init__(self, in_channels, cb_model_name=CB_MODEL_NAME, d_out=D_OUT,
-                 lora_r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT):
+    def __init__(self, in_channels, patch_len=PATCH_LEN, stride=PATCH_STRIDE,
+                 d_model=PATCH_D_MODEL, nhead=PATCH_NHEAD, nlayers=PATCH_NLAYERS,
+                 dropout=PATCH_DROPOUT, ff=PATCH_FF):
         super().__init__()
-        if not HAVE_TRANSFORMERS:
-            raise ImportError(
-                f"transformers not available: {_transformers_err}\n"
-                "Install: pip install transformers accelerate safetensors"
-            )
-        if not HAVE_PEFT:
-            raise ImportError(
-                f"peft not available: {_peft_err}\n"
-                "Install: pip install peft"
-            )
-
         self.in_channels = in_channels
-        self.d_out = d_out
+        self.patch_len   = patch_len
+        self.stride      = patch_len if stride is None else stride
+        self.d_model     = d_model
 
-        self.config = AutoConfig.from_pretrained(cb_model_name, trust_remote_code=True)
-        self.backbone = AutoModel.from_pretrained(
-            cb_model_name,
-            trust_remote_code=True,
-            output_hidden_states=True
+        self.proj = nn.Linear(in_channels * self.patch_len, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=ff, dropout=dropout,
+            batch_first=True
         )
-
-        targets = _discover_lora_targets(self.backbone)
-        if is_main_process():
-            print(f"[PEFT] LoRA targets: {targets}")
-
-        lcfg = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=targets,
-            bias="none",
-            task_type="FEATURE_EXTRACTION",
-        )
-        try:
-            self.backbone = get_peft_model(self.backbone, lcfg)
-        except ValueError as e:
-            if is_main_process():
-                print(f"[PEFT] Warning: {e} -> fallback target_modules=['linear']")
-            lcfg.target_modules = ["linear"]
-            self.backbone = get_peft_model(self.backbone, lcfg)
-
-        hidden_dim = getattr(self.config, "hidden_size", None)
-        if hidden_dim is None:
-            hidden_dim = getattr(self.config, "d_model", None)
-        if hidden_dim is None:
-            raise RuntimeError("Cannot determine Chronos hidden size from config.")
-
-        self.embed_proj = nn.Linear(in_channels, hidden_dim)
-        self.post_proj  = nn.Linear(hidden_dim, d_out)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        # x: (B, T, N, F)
         B, T, N, F = x.shape
-        assert F == self.in_channels, f"CB encoder expected F={self.in_channels}, got {F}"
+        P, S = self.patch_len, self.stride
+        assert F == self.in_channels, f"PatchTST got F={F}, expected {self.in_channels}"
 
-        x_bn = x.permute(0, 2, 1, 3).reshape(B * N, T, F)
-        emb  = self.embed_proj(x_bn)
-        attn_mask = torch.ones(B * N, T, dtype=torch.long, device=emb.device)
+        # per-node
+        x_bn = x.permute(0, 2, 1, 3).reshape(B * N, T, F)  # (B*N, T, F)
 
-        if hasattr(self.backbone, "encoder") and callable(self.backbone.encoder):
-            out = self.backbone.encoder(
-                inputs_embeds=emb,
-                attention_mask=attn_mask,
-                output_hidden_states=True,
-            )
-        else:
-            out = self.backbone(
-                inputs_embeds=emb,
-                attention_mask=attn_mask,
-                output_hidden_states=True,
-            )
+        # pad to fit patches
+        L = (T + S - 1) // S
+        T_pad = (L - 1) * S + P
+        if T_pad < T:
+            L += 1
+            T_pad = (L - 1) * S + P
+        if T_pad > T:
+            pad = torch.zeros(B * N, T_pad - T, F, device=x.device, dtype=x.dtype)
+            x_bn = torch.cat([x_bn, pad], dim=1)  # (B*N, T_pad, F)
 
-        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
-            h_bn = out.last_hidden_state
-        elif hasattr(out, "hidden_states") and out.hidden_states is not None:
-            h_bn = out.hidden_states[-1]
-        else:
-            if isinstance(out, (tuple, list)) and len(out) > 0:
-                h_bn = out[0]
-            else:
-                raise RuntimeError("Backbone forward did not return hidden states.")
+        # unfold into patches
+        x_unf = x_bn.unfold(dimension=1, size=P, step=S)          # (B*N, L, P, F)
+        x_unf = x_unf.contiguous().view(B * N, L, P * F)          # (B*N, L, P*F)
 
-        if h_bn.size(1) > T:
-            h_bn = h_bn[:, :T, :]
-        elif h_bn.size(1) < T:
-            pad_len = T - h_bn.size(1)
-            pad = torch.zeros(h_bn.size(0), pad_len, h_bn.size(2), device=h_bn.device, dtype=h_bn.dtype)
-            h_bn = torch.cat([h_bn, pad], dim=1)
+        # tokens -> transformer
+        tokens = self.proj(x_unf)                                 # (B*N, L, D)
+        tokens = self.dropout(tokens)
+        tokens = self.encoder(tokens)                              # (B*N, L, D)
 
-        h_bn = self.post_proj(h_bn)
-        h = h_bn.view(B, N, T, self.d_out).permute(0, 2, 1, 3)
+        # unpatch by repeating each token across P steps, trim to T
+        tokens_rep = tokens.repeat_interleave(P, dim=1)            # (B*N, L*P, D)
+        steps = tokens_rep[:, :T, :]                               # (B*N, T, D)
+
+        # back to (B, T, N, D)
+        h = steps.view(B, N, T, self.d_model).permute(0, 2, 1, 3)
         return h
 
-    def print_trainable(self):
-        try:
-            self.backbone.print_trainable_parameters()
-        except Exception:
-            total, trainable = 0, 0
-            for p in self.parameters():
-                total += p.numel()
-                if p.requires_grad:
-                    trainable += p.numel()
-            print(f"[PEFT] Trainable params {trainable}/{total} ({100.0*trainable/total:.2f}%)")
 
 # =========================
-# Multi-task model using CB encoder
+# Multi-task pretrain model
 # =========================
-class MultiTaskCBEncoder(nn.Module):
+class MultiTaskPatchTST(nn.Module):
     """
     Encoder + heads:
       - recon_head: reconstruct inputs at masked timesteps (SSL)
@@ -429,68 +312,105 @@ class MultiTaskCBEncoder(nn.Module):
     def __init__(self, in_channels, horizon):
         super().__init__()
         self.horizon = horizon
-        self.encoder = ChronosBoltEncoderPEFT(in_channels=in_channels, d_out=D_OUT)
+        self.encoder = PatchTSTEncoder(in_channels=in_channels)
 
-        self.recon_head = nn.Linear(D_OUT, in_channels)
+        # SSL reconstruction head: (B, T, N, D) -> (B, T, N, F)
+        self.recon_head = nn.Linear(PATCH_D_MODEL, in_channels)
+
+        # Forecast head: mean-pool over time per node, then MLP -> (H * F)
         self.forecast_head = nn.Sequential(
-            nn.Linear(D_OUT, 2 * D_OUT),
+            nn.Linear(PATCH_D_MODEL, 2 * PATCH_D_MODEL),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(2 * D_OUT, horizon * in_channels)
+            nn.Linear(2 * PATCH_D_MODEL, horizon * in_channels)
         )
+
+        # Projection head for contrastive learning
         self.proj_head = nn.Sequential(
-            nn.Linear(D_OUT, D_OUT),
+            nn.Linear(PATCH_D_MODEL, PATCH_D_MODEL),
             nn.GELU(),
-            nn.Linear(D_OUT, D_OUT)
+            nn.Linear(PATCH_D_MODEL, PATCH_D_MODEL)
         )
 
     def encode_steps(self, x):
+        """Return per-step embeddings (B, T, N, D)."""
         return self.encoder(x)
 
     def forward(self, x):
-        h = self.encoder(x)                    # (B, T, N, D_OUT)
+        # x: (B, T, N, F)
+        h = self.encoder(x)                    # (B, T, N, D)
+
+        # Reconstruction at each past step
         recon = self.recon_head(h)             # (B, T, N, F)
-        pooled = h.mean(dim=1)                 # (B, N, D_OUT)
+
+        # Forecast next H steps for all channels
+        pooled = h.mean(dim=1)                 # (B, N, D)
         fut = self.forecast_head(pooled)       # (B, N, H*F)
         B, N, _ = fut.shape
         fut = fut.view(B, N, self.horizon, -1).permute(0, 2, 1, 3)  # (B, H, N, F)
+
         return recon, fut
 
     def pooled_projection(self, x):
+        """
+        For contrastive: encode -> pool across T and N -> projection -> L2 normalize.
+        If CONTRAST_UPDATES_ENCODER is False, we detach to avoid encoder grads here.
+        """
         h = self.encoder(x) if CONTRAST_UPDATES_ENCODER else self.encoder(x).detach()
-        pooled = h.mean(dim=1).mean(dim=1)       # (B, D_OUT)
-        z = self.proj_head(pooled)               # (B, D_OUT)
+        pooled = h.mean(dim=1).mean(dim=1)       # (B, D)
+        z = self.proj_head(pooled)               # (B, D)
         z = F.normalize(z, dim=-1)
         return z
+
 
 # =========================
 # Losses
 # =========================
 def masked_recon_loss(pred, target, mask):
+    """
+    pred/target: (B, T, N, F)
+    mask:       (B, T, 1, 1) 1 where masked (reconstruct), 0 otherwise
+    """
     m = mask.expand_as(pred)
     denom = m.sum().clamp_min(1.0)
     return ((pred - target) ** 2 * m).sum() / denom
 
 def forecast_loss(pred, target):
+    """
+    pred:   (B, H, N, F)
+    target: (B, H, N, F)
+    """
     return torch.mean((pred - target) ** 2)
 
 def info_nce_loss(z1, z2, tau=0.2):
+    """
+    NT-Xent across batch. z1,z2: (B, D), L2-normalized.
+    We compute both directions (z1->z2 and z2->z1) and average.
+    """
     B = z1.size(0)
     if B == 1:
         return torch.tensor(0.0, device=z1.device)
-    sim = (z1 @ z2.t()) / tau
+    sim = (z1 @ z2.t()) / tau           # (B, B)
     labels = torch.arange(B, device=z1.device)
     loss_12 = F.cross_entropy(sim, labels)
     loss_21 = F.cross_entropy(sim.t(), labels)
     return 0.5 * (loss_12 + loss_21)
 
+
 # =========================
 # Masking & Augmentations
 # =========================
 def make_temporal_mask(batch_size, T, mode="random", ratio=0.3, span_len=4, device="cpu"):
+    """
+    Returns mask of shape (B, T, 1, 1) with 1.0 at masked timesteps.
+    - random: IID Bernoulli per step with prob=ratio.
+    - span:   choose K spans of length span_len covering approx ratio of T.
+    """
     if mode == "random":
         m = (torch.rand(batch_size, T, 1, 1, device=device) < ratio).float()
         return m
+
+    # span mode
     K = max(1, ceil((ratio * T) / max(1, span_len)))
     m = torch.zeros(batch_size, T, 1, 1, device=device)
     for b in range(batch_size):
@@ -502,36 +422,51 @@ def make_temporal_mask(batch_size, T, mode="random", ratio=0.3, span_len=4, devi
             m[b, start:start+span_len, :, :] = 1.0
     return m.clamp(max=1.0)
 
+
 def apply_mask(x, mask):
+    """Zero-out masked timesteps. x: (B,T,N,F); mask: (B,T,1,1)."""
     return x * (1.0 - mask)
 
+
 def add_jitter(x, std=0.01):
+    """Add small Gaussian noise."""
     if std <= 0.0:
         return x
     noise = torch.randn_like(x) * std
     return x + noise
 
+
 def dropout_features(x, p=0.0):
+    """Randomly drop features per timestep (channel dropout)."""
     if p <= 0.0:
         return x
     B, T, N, F = x.shape
     mask = (torch.rand(B, 1, 1, F, device=x.device) < p).float()
     return x * (1.0 - mask)
 
+
+# ====== Frequency-domain augmentations (TimesNet-style) ======
 @torch.no_grad()
 def _variance_match(x_aug, x_ref, eps=1e-6):
-    s_ref = x_ref.flatten(1).std(dim=1, keepdim=True).clamp_min(eps)
-    s_aug = x_aug.flatten(1).std(dim=1, keepdim=True).clamp_min(eps)
+    """Rescale x_aug to match the per-sample std of x_ref."""
+    # std over (T,N,F) for each batch element
+    s_ref = x_ref.flatten(1).std(dim=1, keepdim=True).clamp_min(eps)          # (B,1)
+    s_aug = x_aug.flatten(1).std(dim=1, keepdim=True).clamp_min(eps)          # (B,1)
     scale = (s_ref / s_aug).view(-1, 1, 1, 1)
     return x_aug * scale
 
 def _random_band_mask(B, Lf, device, keep=False):
+    """
+    Create (B, Lf, 1, 1) band mask. If keep=False: band-stop; if keep=True: band-keep.
+    """
+    # choose center and width
     centers = torch.rand(B, device=device) * (Lf - 1)
     widths  = torch.empty(B, device=device).uniform_(
         int(FREQ_BAND_WIDTH_RATIO[0] * Lf),
         max(1.0, FREQ_BAND_WIDTH_RATIO[1] * Lf)
     )
-    idx = torch.arange(Lf, device=device).view(1, Lf)
+    # frequency indices
+    idx = torch.arange(Lf, device=device).view(1, Lf)  # (1, Lf)
     mask = torch.ones(B, Lf, 1, 1, device=device)
     for b in range(B):
         c = centers[b]
@@ -539,50 +474,93 @@ def _random_band_mask(B, Lf, device, keep=False):
         lo = (c - w / 2.0).clamp(0, Lf - 1)
         hi = (c + w / 2.0).clamp(0, Lf - 1)
         band = ((idx >= lo) & (idx <= hi)).float().view(1, Lf, 1, 1)
-        mask[b:b+1] = band if keep else (1.0 - band)
+        if keep:
+            mask[b:b+1] = band  # keep only band
+        else:
+            mask[b:b+1] = 1.0 - band  # zero band (stop)
     return mask
 
 def _shelf_curve(Lf, high=True, strength=0.5, device="cpu"):
+    """
+    Build a high/low shelf attenuation curve over frequencies.
+    Returns shape (1, Lf, 1, 1)
+    """
     f = torch.linspace(0.0, 1.0, steps=Lf, device=device).view(1, Lf, 1, 1)
     if high:
-        curve = 1.0 - strength * f.pow(1.0)
+        curve = 1.0 - strength * f.pow(1.0)  # attenuate high freq
     else:
-        curve = 1.0 - strength * (1.0 - f).pow(1.0)
+        curve = 1.0 - strength * (1.0 - f).pow(1.0)  # attenuate low freq
     return curve.clamp_min(0.0)
 
 def freq_augment(x, prob=FREQ_AUG_PROB):
+    """
+    Apply a mix of frequency-domain augs on x (B,T,N,F) with probability `prob`:
+      - amplitude scaling in freq domain
+      - phase jitter
+      - band stop/keep
+      - spectral dropout
+      - shelving (high/low attenuation)
+    Then normalize to match original variance.
+    """
     if (not USE_FREQ_AUG) or (torch.rand(1).item() > prob):
         return x
+
     B, T, N, Fdim = x.shape
-    Xf = torch.fft.rfft(x, dim=1)
+    # rFFT along time
+    Xf = torch.fft.rfft(x, dim=1)  # (B, Lf, N, F), complex
     Lf = Xf.size(1)
+
+    # amplitude scaling
     if FREQ_AMP_STD > 0.0:
         amp = torch.randn(B, Lf, 1, 1, device=x.device, dtype=Xf.real.dtype) * FREQ_AMP_STD + 1.0
         Xf = Xf * amp
+
+    # phase jitter
     if FREQ_PHASE_STD > 0.0:
         phi = torch.randn(B, Lf, 1, 1, device=x.device, dtype=Xf.real.dtype) * FREQ_PHASE_STD
         rot = torch.complex(torch.cos(phi), torch.sin(phi))
         Xf = Xf * rot
-    keep = not (torch.rand(1).item() < FREQ_BAND_PROB)
-    band_mask = _random_band_mask(B, Lf, device=x.device, keep=keep)
+
+    # band op (stop or keep)
+    if torch.rand(1).item() < FREQ_BAND_PROB:
+        keep = False
+    else:
+        keep = True
+    band_mask = _random_band_mask(B, Lf, device=x.device, keep=keep)  # real mask
     Xf = Xf * band_mask
+
+    # spectral dropout
     if torch.rand(1).item() < FREQ_DROPOUT_PROB and FREQ_DROPOUT_FRAC > 0.0:
+        # choose bins to drop per-sample
         k = max(1, int(FREQ_DROPOUT_FRAC * Lf))
         drop = torch.zeros(B, Lf, 1, 1, device=x.device)
         for b in range(B):
             idx = torch.randperm(Lf, device=x.device)[:k]
             drop[b, idx] = 1.0
         Xf = Xf * (1.0 - drop)
+
+    # high/low shelf
     if torch.rand(1).item() < FREQ_SHELF_PROB:
         strength = torch.empty(1, device=x.device).uniform_(*FREQ_SHELF_STRENGTH).item()
         high = bool(torch.randint(0, 2, (1,), device=x.device).item())
-        shelf = _shelf_curve(Lf, high=high, strength=strength, device=x.device)
+        shelf = _shelf_curve(Lf, high=high, strength=strength, device=x.device)  # (1,Lf,1,1)
         Xf = Xf * shelf
-    x_aug = torch.fft.irfft(Xf, n=T, dim=1)
+
+    # inverse FFT (ensure original length T)
+    x_aug = torch.fft.irfft(Xf, n=T, dim=1)  # (B,T,N,F)
+    # variance match (stabilize magnitude)
     x_aug = _variance_match(x_aug, x_ref=x)
     return x_aug
 
+
 def make_view(x, mask_mode, mask_ratio, span_len, jitter_std, feat_drop):
+    """
+    Build one augmented view:
+      - temporal mask (random/span),
+      - optional feature dropout,
+      - optional Gaussian jitter,
+      - frequency-domain augmentations.
+    """
     B, T, _, _ = x.shape
     m = make_temporal_mask(B, T, mode=mask_mode, ratio=mask_ratio, span_len=span_len, device=x.device)
     xv = apply_mask(x, m)
@@ -591,8 +569,9 @@ def make_view(x, mask_mode, mask_ratio, span_len, jitter_std, feat_drop):
     xv = freq_augment(xv, prob=FREQ_AUG_PROB)
     return xv
 
+
 # =========================
-# Small eval helpers for rolling validation
+# Rolling-val helpers (copied from CB script, unchanged)
 # =========================
 def _pivot_pred_long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
     if df_long.empty:
@@ -643,10 +622,6 @@ def _truth_wide_for_val(ds_train, aux, horizon, train_last_day=80) -> pd.DataFra
 
 @torch.no_grad()
 def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80) -> pd.DataFrame:
-    # Run ONLY on rank-0 to avoid duplicating work/memory; weights are synced by DDP
-    if IS_DDP and not is_main_process():
-        return pd.DataFrame(columns=["timestamp", "location", "pred"])
-
     model.eval()
     X_all = aux["X_all_scaled"]
     ts    = aux["timestamps"]
@@ -669,10 +644,10 @@ def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80)
         Xin = X_all[start_ctx:end_idx+1, :, :].reshape(1, SEQ_LEN, N, Din)
         xb = torch.tensor(Xin, dtype=torch.float32, device=DEVICE)
 
-        # DDP-wrapped model works fine on rank-0
-        recon, fut = (model.module if IS_DDP else model)(xb)   # fut: (1, H, N, F)
-        fut_np = fut[0].detach().cpu().numpy()                 # (H, N, F)
+        recon, fut = model(xb)                  # fut: (1, H, N, F)
+        fut_np = fut[0].detach().cpu().numpy()  # (H, N, F)
 
+        # de-scale only the first channel (outage) for metric, same as CB code
         pred_sc = fut_np[:, :, 0].transpose(1, 0)  # (N, H)
 
         y_mu = float(scalers["y_mu"].flatten()[0])
@@ -693,86 +668,34 @@ def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80)
     else:
         return pd.DataFrame(columns=["timestamp", "location", "pred"])
 
+
 # =========================
-# Training loop (with DDP + dual validation: loss + RMSE)
+# Training loop (now mirrors CB script’s val/saving/logging)
 # =========================
 def train_multitask_contrast(ds_train):
     # --- Build split-aware train windows (fit scalers on days 1..80) ---
     X_tr, Y_fut_tr, Din, scalers, aux = prepare_multitask_windows_split(
         ds_train, seq_len=SEQ_LEN, horizon=H_PRE, train_last_day=TRAIN_LAST_DAY
     )
-    train_t = torch.tensor(X_tr, dtype=torch.float32)
-    train_y = torch.tensor(Y_fut_tr, dtype=torch.float32)
-    train_ds = TensorDataset(train_t, train_y)
+    dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
+                            torch.tensor(Y_fut_tr, dtype=torch.float32))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # --- Build validation windows for loss (day d -> day d+1) ---
     X_val, Y_val = build_val_windows_day_ahead(aux, horizon=H_PRE, seq_len=SEQ_LEN, train_last_day=TRAIN_LAST_DAY)
     have_val_loss = X_val.shape[0] > 0
     if have_val_loss:
-        val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
-                               torch.tensor(Y_val, dtype=torch.float32))
-    else:
-        val_ds = None
-
-    # Per-process batch size (global BATCH_SIZE split across GPUs)
-    per_device_bs = max(1, BATCH_SIZE // WORLD_SIZE)
-
-    # Samplers (DDP)
-    if IS_DDP:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False) if have_val_loss else None
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=per_device_bs,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        pin_memory=True,
-        drop_last=False,
-        num_workers=2
-    )
-    if have_val_loss:
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=per_device_bs,
-            shuffle=False,
-            sampler=val_sampler,
-            pin_memory=True,
-            drop_last=False,
-            num_workers=2
-        )
+        val_set = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                                torch.tensor(Y_val, dtype=torch.float32))
+        val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
     else:
         val_loader = None
 
     # --- Model ---
-    model = MultiTaskCBEncoder(in_channels=Din, horizon=H_PRE).to(DEVICE)
+    model = MultiTaskPatchTST(in_channels=Din, horizon=H_PRE).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # Ensure trainable parts include LoRA + our adapters & heads
-    for p in model.encoder.embed_proj.parameters(): p.requires_grad = True
-    for p in model.encoder.post_proj.parameters():  p.requires_grad = True
-    for p in model.recon_head.parameters():         p.requires_grad = True
-    for p in model.forecast_head.parameters():      p.requires_grad = True
-    for p in model.proj_head.parameters():          p.requires_grad = True
-
-    if is_main_process():
-        model.encoder.print_trainable()
-
-    # Wrap with DDP (after moving to device & setting requires_grad)
-    if IS_DDP:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[LOCAL_RANK],
-            output_device=LOCAL_RANK,
-            find_unused_parameters=False
-        )
-
-    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
-                           lr=LR, weight_decay=WEIGHT_DECAY)
-
-    # Prepare ground-truth for rolling validation RMSE (rank-0 only uses it)
+    # Prepare ground-truth for rolling validation RMSE once
     df_truth_val = _truth_wide_for_val(ds_train, aux, H_PRE, train_last_day=TRAIN_LAST_DAY)
 
     best = {"loss": float("inf"), "rmse": float("inf"), "epoch": -1}
@@ -780,7 +703,7 @@ def train_multitask_contrast(ds_train):
     def compute_val_loss():
         if val_loader is None:
             return float("nan")
-        (model.module if IS_DDP else model).eval()
+        model.eval()
         total = 0.0
         count = 0
         with torch.no_grad():
@@ -793,7 +716,7 @@ def train_multitask_contrast(ds_train):
                     Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
                 )
                 xmasked = apply_mask(xb, mask_ssl)
-                recon, fut = (model.module if IS_DDP else model)(xmasked)
+                recon, fut = model(xmasked)
                 l_ssl  = masked_recon_loss(recon, xb, mask_ssl)
                 l_fore = forecast_loss(fut, yb)
                 if USE_CONTRASTIVE:
@@ -801,32 +724,23 @@ def train_multitask_contrast(ds_train):
                                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
                     x2 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
                                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
-                    z1 = (model.module if IS_DDP else model).pooled_projection(x1)
-                    z2 = (model.module if IS_DDP else model).pooled_projection(x2)
+                    z1 = model.pooled_projection(x1)
+                    z2 = model.pooled_projection(x2)
                     l_contrast = info_nce_loss(z1, z2, tau=TAU)
                 else:
                     l_contrast = torch.tensor(0.0, device=xb.device)
                 l = W_SSL * l_ssl + W_FORECAST * l_fore + W_CONTRAST * l_contrast
                 total += l.item() * xb.size(0)
                 count += xb.size(0)
-        # Reduce across processes
-        total = ddp_all_reduce(total, op=dist.ReduceOp.SUM)
-        count = ddp_all_reduce(count, op=dist.ReduceOp.SUM)
-        return total / max(1.0, count)
+        return total / max(1, count)
 
     for epoch in range(1, EPOCHS + 1):
-        if IS_DDP:
-            # Ensure different shuffles each epoch
-            train_sampler.set_epoch(epoch)
-            if val_loader is not None and isinstance(val_loader.sampler, torch.utils.data.distributed.DistributedSampler):
-                val_loader.sampler.set_epoch(epoch)
-
-        (model.module if IS_DDP else model).train()
-        epoch_loss_local = 0.0
-        epoch_count_local = 0
+        model.train()
+        epoch_loss = 0.0
+        seen_samples = 0  # track actual samples processed (mirrors CB log)
         start = time.time()
 
-        for xb, yb in tqdm(train_loader, desc=f"Pretrain Epoch {epoch}/{EPOCHS}", leave=False) if is_main_process() else train_loader:
+        for xb, yb in tqdm(loader, desc=f"Pretrain Epoch {epoch}/{EPOCHS}", leave=False):
             xb = xb.to(DEVICE)      # (B, T, N, F)
             yb = yb.to(DEVICE)      # (B, H, N, F)
 
@@ -839,14 +753,15 @@ def train_multitask_contrast(ds_train):
             xmasked = apply_mask(xb, mask_ssl)
 
             # ---------- Forward (reconstruction + forecasting) ----------
-            opt.zero_grad(set_to_none=True)
-            recon, fut = (model.module if IS_DDP else model)(xmasked)  # recon: (B,T,N,F), fut: (B,H,N,F)
+            opt.zero_grad()
+            recon, fut = model(xmasked)  # recon: (B,T,N,F), fut: (B,H,N,F)
 
             loss_ssl  = masked_recon_loss(recon, xb, mask_ssl)
             loss_fore = forecast_loss(fut, yb)
 
             # ---------- Contrastive branch ----------
             if USE_CONTRASTIVE:
+                # Two independent augmented views
                 x1 = make_view(
                     xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
                     jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
@@ -855,8 +770,8 @@ def train_multitask_contrast(ds_train):
                     xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
                     jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
                 )
-                z1 = (model.module if IS_DDP else model).pooled_projection(x1)  # (B, D_OUT)
-                z2 = (model.module if IS_DDP else model).pooled_projection(x2)  # (B, D_OUT)
+                z1 = model.pooled_projection(x1)  # (B, D)
+                z2 = model.pooled_projection(x2)  # (B, D)
                 loss_contrast = info_nce_loss(z1, z2, tau=TAU)
             else:
                 loss_contrast = torch.tensor(0.0, device=xb.device)
@@ -867,60 +782,49 @@ def train_multitask_contrast(ds_train):
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
 
-            epoch_loss_local += loss.item() * xb.size(0)
-            epoch_count_local += xb.size(0)
+            epoch_loss += loss.item() * Bsz
+            seen_samples += Bsz
 
-        # Reduce epoch loss across processes for logging
-        epoch_loss_total = ddp_all_reduce(epoch_loss_local, op=dist.ReduceOp.SUM)
-        epoch_count_total = ddp_all_reduce(epoch_count_local, op=dist.ReduceOp.SUM)
-        epoch_loss = epoch_loss_total / max(1.0, epoch_count_total)
+        # Average by actual samples (logging mirrors CB)
+        epoch_loss /= max(1, seen_samples)
         took = time.time() - start
-
-        if is_main_process():
-            print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
-                  f"time={took:.2f}s")
+        print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
+              f"ssl={loss_ssl.item():.6f} fore={loss_fore.item():.6f} "
+              f"contrast={loss_contrast.item():.6f} time={took:.2f}s | "
+              f"batches={len(loader)} samples={seen_samples}")
 
         # ---------- Validation: loss ----------
         val_loss = compute_val_loss()
 
-        # ---------- Validation: rolling RMSE (rank-0 only) ----------
-        if is_main_process() and df_truth_val is not None and not df_truth_val.empty:
+        # ---------- Validation: rolling RMSE ----------
+        if df_truth_val is not None and not df_truth_val.empty:
             df_pred_val = _predict_val_roll(ds_train, model, scalers, H_PRE, aux, TRAIN_LAST_DAY)
-            rmse_val = _per_county_rmse_mean(df_truth_val, df_pred_val) if not df_pred_val.empty else float("nan")
+            if not df_pred_val.empty:
+                rmse_val = _per_county_rmse_mean(df_truth_val, df_pred_val)
+            else:
+                rmse_val = float("nan")
         else:
             rmse_val = float("nan")
 
-        # Broadcast rmse_val to all ranks for consistent decision (optional)
-        if IS_DDP:
-            _buf = torch.tensor([rmse_val], device=DEVICE, dtype=torch.float64)
-            dist.broadcast(_buf, src=0)
-            rmse_val = float(_buf.item())
+        print(f"[Pretrain Val] Epoch {epoch:02d}: ValLoss={val_loss:.6f} | Rolling RMSE={rmse_val:.4f}")
 
-        if is_main_process():
-            print(f"[Pretrain Val] Epoch {epoch:02d}: ValLoss={val_loss:.6f} | Rolling RMSE={rmse_val:.4f}")
-
-        # ---------- Save best ----------
+        # ---------- Save best (same policy as CB script) ----------
         save_by_loss = (SAVE_BEST_BY.lower() == "loss")
-        metric_current = val_loss if save_by_loss else rmse_val
-        metric_best = best["loss"] if save_by_loss else best["rmse"]
-        improved = np.isfinite(metric_current) and (metric_current < metric_best)
-
-        if is_main_process() and improved:
+        metric = val_loss if save_by_loss else rmse_val
+        better = np.isfinite(metric) and (metric < best["loss"] if save_by_loss else metric < best["rmse"])
+        if better:
             if save_by_loss:
-                best["loss"] = metric_current
+                best["loss"] = metric
             else:
-                best["rmse"] = metric_current
+                best["rmse"] = metric
             best["epoch"] = epoch
-            enc_state = (model.module if IS_DDP else model).encoder.state_dict()
             torch.save(
                 {
-                    "cb_model_name": CB_MODEL_NAME,
-                    "state_dict": enc_state,
-                    "d_out": D_OUT,
+                    "state_dict": model.encoder.state_dict(),
                     "in_channels": Din,
-                    "lora_r": LORA_R,
-                    "lora_alpha": LORA_ALPHA,
-                    "lora_dropout": LORA_DROPOUT,
+                    "patch_len": PATCH_LEN,
+                    "patch_stride": PATCH_STRIDE,
+                    "d_model": PATCH_D_MODEL,
                     "val_loss": val_loss,
                     "val_rmse": rmse_val,
                     "epoch": epoch,
@@ -928,29 +832,18 @@ def train_multitask_contrast(ds_train):
                 },
                 SAVE_PATH,
             )
-            print(f"[Pretrain Val] New best ({SAVE_BEST_BY}={metric_current:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
-            try:
-                os.makedirs(SAVE_ADAPTER_DIR, exist_ok=True)
-                (model.module if IS_DDP else model).encoder.backbone.save_pretrained(SAVE_ADAPTER_DIR)
-                print(f"[Pretrain Val] Saved LoRA adapter/backbone to: {SAVE_ADAPTER_DIR}")
-            except Exception as e:
-                print(f"[Pretrain Val] Adapter export skipped ({e}).")
+            print(f"[Pretrain Val] New best ({SAVE_BEST_BY}={metric:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
 
-    # Cleanly finalize DDP
-    if IS_DDP:
-        dist.barrier()
+    # Note: best model already saved when improved.
+
 
 # =========================
 # Main
 # =========================
 def main():
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
-    try:
-        train_multitask_contrast(ds_train)
-    finally:
-        ds_train.close()
-    if IS_DDP:
-        dist.destroy_process_group()
+    train_multitask_contrast(ds_train)
+    ds_train.close()
 
 if __name__ == "__main__":
     main()

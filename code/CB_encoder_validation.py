@@ -17,7 +17,7 @@ OUT_DIR   = "results_seq/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 SEQ_LEN       = 24
-BATCH_SIZE    = 32
+BATCH_SIZE    = 16
 EPOCHS        = 20
 LR            = 1e-4
 WEIGHT_DECAY  = 1e-3
@@ -46,13 +46,17 @@ STEM_DROPOUT  = 0.5
 # PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst.pt" # e.g., "results_seq/pretrained_patchtst.pt" or None
 # PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask.pt"
 # PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask_contrast.pt"
-PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask_contrast_freq.pt"
+# PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask_contrast_freq.pt"
+PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
 ENCODER_LR              = 2e-5  # smaller LR for encoder fine-tuning
 FREEZE_ENCODER          = True  # if True, keep encoder frozen during training
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
 USE_CB_ENCODER          = True
-CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
+# CB_ENCODER_CKPT         = "results_seq/cb_peft_adapter_tsmix.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
+CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 88   # use days 1..80 for training; 81..end for validation
@@ -636,7 +640,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             if np.isfinite(rmse) and rmse < best["rmse"]:
                 best["rmse"] = rmse
                 best["epoch"] = epoch
-                save_path = os.path.join(OUT_DIR, f"best_stgnn_{label}.pt")
+                save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
                 torch.save(
                     {
                         "epoch": epoch,
@@ -777,7 +781,7 @@ def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
         if np.isfinite(rmse) and rmse < best["rmse"]:
             best["rmse"] = rmse
             best["epoch"] = epoch
-            save_path = os.path.join(OUT_DIR, f"best_stgnn_{label}.pt")
+            save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
             torch.save(
                 {
                     "epoch": epoch,
@@ -840,7 +844,7 @@ def main():
     # ----- Test evaluation using best models, then write CSVs (keep previous behavior) -----
     # 24h
     if mdl24 is not None:
-        best24_path = os.path.join(OUT_DIR, "best_stgnn_24h.pt")
+        best24_path = os.path.join(OUT_DIR, "best_enc-dec_24h.pt")
         if os.path.exists(best24_path):
             ckpt24 = torch.load(best24_path, map_location=DEVICE)
             try:
@@ -863,7 +867,7 @@ def main():
 
     # 48h
     if mdl48 is not None:
-        best48_path = os.path.join(OUT_DIR, "best_stgnn_48h.pt")
+        best48_path = os.path.join(OUT_DIR, "best_enc-dec_48h.pt")
         if os.path.exists(best48_path):
             ckpt48 = torch.load(best48_path, map_location=DEVICE)
             try:

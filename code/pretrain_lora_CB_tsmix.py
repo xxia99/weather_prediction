@@ -21,11 +21,11 @@ DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 # Windows / data
 SEQ_LEN     = 24     # context length T (match downstream)
-H_PRE       = 24     # pretraining forecast horizon H
+H_PRE       = 48  # 24     # pretraining forecast horizon H
 BATCH_SIZE  = 16  # batch size for training
 
 # Training
-EPOCHS          = 20
+EPOCHS          = 100
 LR              = 1e-4
 WEIGHT_DECAY    = 1e-3
 GRAD_CLIP_NORM  = 5.0
@@ -88,9 +88,9 @@ TSMIXUP_LEN_FRAC   = (0.5, 1.0)  # segment length as fraction of T (and mapped t
 TSMIXUP_EPS        = 1e-6    # numerical stability for scaling
 
 # Save path (wrapper state_dict)
-SAVE_PATH = os.path.join(OUT_DIR, "pretrained_cb_encoder_peft_multitask_contrast_freq.pt")
+SAVE_PATH = os.path.join(OUT_DIR, f"pretrained_cb_encoder_peft_tsmix_H={H_PRE}.pt")
 # Optional: export LoRA adapter/backbone in HF format
-SAVE_ADAPTER_DIR = os.path.join(OUT_DIR, "cb_peft_adapter_multitask")
+SAVE_ADAPTER_DIR = os.path.join(OUT_DIR, f"cb_peft_adapter_tsmix_H={H_PRE}")
 
 # =========================
 # Utils
