@@ -14,10 +14,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from event_stratified_eval import event_stratified_report
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq/"
+OUT_DIR   = "results_transformer/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 SEQ_LEN      = 24
@@ -32,7 +33,7 @@ NLAYERS      = 2
 DROPOUT      = 0.1
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
-TRAIN_LAST_DAY = 88
+TRAIN_LAST_DAY = 80
 
 # ---------------- utils ----------------
 def open_ds(path):
@@ -310,6 +311,16 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     })
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
 
+# -------------------- COERCE TIMESTAMPS (helper) --------------------
+def _coerce_ts64(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure df['timestamp'] is datetime64[ns] (not object)."""
+    if df is None or df.empty:
+        return df
+    if "timestamp" in df.columns:
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("datetime64[ns]")
+    return df
+
 # -------- unified callback (rolling val + test; save best by val RMSE) --------
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                               train_last_day=80,
@@ -333,10 +344,45 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     def _callback(model, epoch):
         # ---- Validation (rolling) ----
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
-        if df_pred_val.empty or df_truth_val.empty:
+
+        # ---------- COERCE TIMESTAMPS BEFORE STRATIFIED REPORT ----------
+        df_pred_val = _coerce_ts64(df_pred_val)
+        df_truth_val_local = _coerce_ts64(df_truth_val)
+
+        # Event-stratified RMSEs (Calm vs Stormy), after anchor
+        try:
+            event_stratified_report(
+                ds_train,
+                df_truth_val_local,
+                df_pred_val,
+                train_last_day=TRAIN_LAST_DAY,
+                method="mean",
+                storm_top_q=0.80,
+                calm_bottom_q=0.50,
+                calm_n=10,
+                seed=42
+            )
+        except ValueError as e:
+            # One more defensive attempt with explicit dtype alignment
+            print(f"[Val {label}] Note: re-trying event_stratified_report after dtype coercion: {e}")
+            df_pred_val["timestamp"] = pd.to_datetime(df_pred_val["timestamp"]).astype("datetime64[ns]")
+            df_truth_val_local["timestamp"] = pd.to_datetime(df_truth_val_local["timestamp"]).astype("datetime64[ns]")
+            event_stratified_report(
+                ds_train,
+                df_truth_val_local,
+                df_pred_val,
+                train_last_day=TRAIN_LAST_DAY,
+                method="mean",
+                storm_top_q=0.80,
+                calm_bottom_q=0.50,
+                calm_n=10,
+                seed=42
+            )
+
+        if df_pred_val.empty or df_truth_val_local.empty:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
         else:
-            rmse = per_county_rmse_mean(df_truth_val, df_pred_val)
+            rmse = per_county_rmse_mean(df_truth_val_local, df_pred_val)
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_val:.4f})")
 
             # Save best by validation RMSE

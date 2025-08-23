@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from event_stratified_eval import event_stratified_report  # <-- added
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -630,6 +631,20 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     def _callback(model, epoch):
         # ---- Validation (rolling) ----
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
+
+        # Calm/Storm event-stratified validation (added)
+        event_stratified_report(
+            ds_train,
+            df_truth_val,
+            df_pred_val,
+            train_last_day=TRAIN_LAST_DAY,
+            method="mean",          # or "max"
+            storm_top_q=0.80,       # top 20% days as stormy
+            calm_bottom_q=0.50,     # bottom 50% as calm pool
+            calm_n=10,              # sample 10 calm days
+            seed=42
+        )
+
         if df_pred_val.empty or df_truth_val.empty:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
             # still compute test if requested
