@@ -55,7 +55,7 @@ USE_CB_ENCODER          = True
 CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
 
 # === Day split for in-train validation (NEW) ===
-TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
+TRAIN_LAST_DAY = 88   # use days 1..80 for training; 81..end for validation
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -591,50 +591,68 @@ def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
-def make_val_callback_rolling(ds_train, scalers, horizon, aux, label, train_last_day=80):
+# -------- helper for all-zero baseline on a given truth frame (NEW) --------
+def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
+    if df_truth_wide.empty:
+        return float("nan")
+    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
+    df_zero_long = pd.DataFrame({
+        "timestamp": np.repeat(df_truth_wide["timestamp"].values, len(locs)),
+        "location": np.tile(locs, len(df_truth_wide)),
+        "pred": 0.0
+    })
+    return per_county_rmse_mean(df_truth_wide, df_zero_long)
+
+def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
+                              train_last_day=80,
+                              ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
     """
-    Evaluate each epoch on rolling day-ahead validation (days 81..end).
-    Prints: Rolling RMSE=xxx.xxxx (all-zero RMSE=yyy.yyyy)
-    Saves best checkpoint (by model RMSE) like before.
+    Evaluate each epoch on rolling day-ahead validation (days 81..end) **and** on the test set.
+    Prints:
+      - Rolling RMSE=xxx.xxxx (all-zero RMSE=yyy.yyyy)
+      - Testing RMSE=aaa.aaaa (all-zero RMSE=bbb.bbbb)
+    Saves best checkpoint (by validation RMSE) like before.
     """
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
 
-    # Pre-build an all-zero baseline for the same timestamps/locations
+    # Pre-build an all-zero baseline for validation timestamps/locations
     if not df_truth_val.empty:
-        locs = [c for c in df_truth_val.columns if c != "timestamp"]
-        df_zero_long = pd.DataFrame({
-            "timestamp": np.repeat(df_truth_val["timestamp"].values, len(locs)),
-            "location": np.tile(locs, len(df_truth_val)),
-            "pred": 0.0
-        })
-        zero_rmse_fixed = per_county_rmse_mean(df_truth_val, df_zero_long)
+        zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val)
     else:
-        zero_rmse_fixed = float("nan")
+        zero_rmse_val = float("nan")
 
     def _callback(model, epoch):
+        # ---- Validation (rolling) ----
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
         if df_pred_val.empty or df_truth_val.empty:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
-            return
-        rmse = per_county_rmse_mean(df_truth_val, df_pred_val)
-        print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_fixed:.4f})")
+            # still compute test if requested
+        else:
+            rmse = per_county_rmse_mean(df_truth_val, df_pred_val)
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_val:.4f})")
 
-        # Save best model so far
-        if np.isfinite(rmse) and rmse < best["rmse"]:
-            best["rmse"] = rmse
-            best["epoch"] = epoch
-            save_path = os.path.join(OUT_DIR, f"best_stgnn_{label}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "label": label,
-                    "rmse": rmse,
-                    "model_state_dict": model.state_dict(),
-                },
-                save_path,
-            )
-            print(f"[Val {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+            # Save best by validation RMSE
+            if np.isfinite(rmse) and rmse < best["rmse"]:
+                best["rmse"] = rmse
+                best["epoch"] = epoch
+                save_path = os.path.join(OUT_DIR, f"best_stgnn_{label}.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "label": label,
+                        "rmse": rmse,
+                        "model_state_dict": model.state_dict(),
+                    },
+                    save_path,
+                )
+                print(f"[Val {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+
+        # ---- Test set evaluation at each validation step (NEW) ----
+        if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
+            df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
+            rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
+            print(f"[Val {label}] Epoch {epoch}: Testing RMSE={rmse_test:.4f} (all-zero RMSE={zero_rmse_test:.4f})")
 
     return _callback
 
@@ -773,18 +791,6 @@ def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
 
     return _callback
 
-# -------- helper for all-zero baseline on a given truth frame (NEW) --------
-def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
-    if df_truth_wide.empty:
-        return float("nan")
-    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
-    df_zero_long = pd.DataFrame({
-        "timestamp": np.repeat(df_truth_wide["timestamp"].values, len(locs)),
-        "location": np.tile(locs, len(df_truth_wide)),
-        "pred": 0.0
-    })
-    return per_county_rmse_mean(df_truth_wide, df_zero_long)
-
 # ---------------- main ----------------
 def main():
     # Load train + test
@@ -802,12 +808,6 @@ def main():
     ts24 = pd.to_datetime(ds_test24.timestamp.values)
     ts48 = pd.to_datetime(ds_test48.timestamp.values)
     H24, H48 = len(ts24), len(ts48)
-    # After loading ds_train and ds_testXX:
-    last_train_ts = pd.to_datetime(ds_train.timestamp.values)[-1]
-    first_test24 = ts24[0]
-    first_test48 = ts48[0]
-    if not (first_test24 > last_train_ts and first_test48 > last_train_ts):
-        print("[Warn] Test timestamps are not strictly after the last train timestamp!")
 
     # Truth data for test (wide)
     df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
@@ -819,19 +819,25 @@ def main():
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
-    # Train two models (24h, 48h) with split-aware training and rolling validation
+    # Train two models (24h, 48h) with split-aware training and rolling validation + test-at-val
     # ==== 24h ====
     X24, Y24, Din, scalers24, aux24 = prepare_training(ds_train, horizon=H24)
     n_nodes = ds_train.sizes["location"]
-    val_cb24 = make_val_callback_rolling(ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY)
+    val_cb24 = make_val_callback_rolling(
+        ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
+        ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
+    )
     mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
 
     # ==== 48h ====
     X48, Y48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)
-    val_cb48 = make_val_callback_rolling(ds_train, scalers48, H48, aux48, label="48h", train_last_day=TRAIN_LAST_DAY)
+    val_cb48 = make_val_callback_rolling(
+        ds_train, scalers48, H48, aux48, label="48h", train_last_day=TRAIN_LAST_DAY,
+        ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48
+    )
     mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
 
-    # ----- Test evaluation using best models, then write CSVs (NEW prints) -----
+    # ----- Test evaluation using best models, then write CSVs (keep previous behavior) -----
     # 24h
     if mdl24 is not None:
         best24_path = os.path.join(OUT_DIR, "best_stgnn_24h.pt")

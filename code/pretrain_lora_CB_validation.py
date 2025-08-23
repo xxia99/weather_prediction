@@ -17,12 +17,12 @@ SPLIT_DIR   = "data/"
 OUT_DIR     = "results_seq/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 # Windows / data
 SEQ_LEN     = 24     # context length T (match downstream)
 H_PRE       = 24     # pretraining forecast horizon H
-BATCH_SIZE  = 32
+BATCH_SIZE  = 16  # batch size for training
 
 # Training
 EPOCHS          = 20
@@ -73,11 +73,11 @@ LORA_ALPHA      = 16
 LORA_DROPOUT    = 0.05
 
 # ---------- Train/Val split by days ----------
-TRAIN_LAST_DAY = 80  # use days 1..80 for training; 81..end for day-ahead validation
+TRAIN_LAST_DAY = 88  # use days 1..80 for training; 81..end for day-ahead validation
 
 # ---------- Save best metric (NEW) ----------
 # Choose which metric picks the best checkpoint: "loss" or "rmse"
-SAVE_BEST_BY = "loss"
+SAVE_BEST_BY = "rmse"
 
 # Save path (wrapper state_dict)
 SAVE_PATH = os.path.join(OUT_DIR, "pretrained_cb_encoder_peft_multitask_contrast_freq.pt")
