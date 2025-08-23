@@ -55,11 +55,12 @@ FREEZE_ENCODER          = True  # if True, keep encoder frozen during training
 USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
 # CB_ENCODER_CKPT         = "results_seq/cb_peft_adapter_tsmix.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
-CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"
-# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"
+CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 
 # === Day split for in-train validation (NEW) ===
-TRAIN_LAST_DAY = 88   # use days 1..80 for training; 81..end for validation
+TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
+LOSS_HUBER_BETA = 1.0  # Huber delta
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -692,6 +693,7 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
 
     loss_fn = nn.MSELoss()
     # loss_fn = nn.SmoothL1Loss(beta=1.0)
+    loss_fn = nn.SmoothL1Loss(beta=LOSS_HUBER_BETA)
 
     for epoch in range(EPOCHS):
         model.train()
