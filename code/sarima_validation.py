@@ -26,30 +26,9 @@ CALM_BOTTOM_Q  = 0.50     # bottom 50% pool = calm
 CALM_N         = 10       # sample 10 calm days
 BEST_BY        = "overall"  # metric to select best
 
-def _pivot_pred_long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
-    if df_long.empty:
-        return pd.DataFrame(columns=["timestamp", *locs])
-    pivot = df_long.pivot_table(index="timestamp", columns="location", values="pred",
-                                aggfunc="sum", fill_value=0.0)
-    pivot = pivot.reindex(columns=locs, fill_value=0.0).sort_index().reset_index()
-    pivot.columns.name = None
-    return pivot
 
-def _per_county_rmse_mean(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame) -> float:
-    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
-    df_pred_wide = _pivot_pred_long_to_wide(df_pred_long, locs)
-    df = df_truth_wide.merge(df_pred_wide, on="timestamp", how="inner",
-                             suffixes=("_true", "_pred"))
-    if df.empty:
-        return float("nan")
-    rmses = []
-    for loc in locs:
-        yt = df[f"{loc}_true"].values.astype(float)
-        yp = df[f"{loc}_pred"].values.astype(float) if f"{loc}_pred" in df.columns else np.zeros_like(yt)
-        rmses.append(float(np.sqrt(np.mean((yt - yp) ** 2))))
-    return float(np.mean(rmses)) if rmses else float("nan")
-
-def all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
+def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
+    """RMSE of an all-zero predictor against the given truth frame."""
     if df_truth_wide.empty:
         return float("nan")
     locs = [c for c in df_truth_wide.columns if c != "timestamp"]
@@ -58,7 +37,7 @@ def all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
         "location": np.tile(locs, len(df_truth_wide)),
         "pred": 0.0,
     })
-    return _per_county_rmse_mean(df_truth_wide, df_zero_long)
+    return per_county_rmse_mean(df_truth_wide, df_zero_long)
 
 def compute_day_indices(ts_np: np.ndarray):
     ts = pd.to_datetime(ts_np)
@@ -103,10 +82,20 @@ def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
         df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"])
     return df_truth_sel, df_pred_sel
 
+def _coerce_ts64(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure df['timestamp'] is datetime64[ns]."""
+    if df is None or df.empty:
+        return df
+    if "timestamp" in df.columns:
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("datetime64[ns]")
+    return df
+
+
 def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
                       train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
-    rmse_overall = _per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
-    zero_overall = all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
+    rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
+    zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
     rng = np.random.default_rng(seed)
     ts = ds_train.timestamp.values
@@ -133,16 +122,16 @@ def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
 
     if len(ts_calm) > 0:
         truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
-        rmse_calm = _per_county_rmse_mean(truth_calm, pred_calm)
-        zero_calm = all_zero_rmse_for_truth(truth_calm)
+        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        zero_calm = _all_zero_rmse_for_truth(truth_calm)
         n_calm = len(calm_days)
     else:
         rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
 
     if len(ts_storm) > 0:
         truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
-        rmse_storm = _per_county_rmse_mean(truth_storm, pred_storm)
-        zero_storm = all_zero_rmse_for_truth(truth_storm)
+        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        zero_storm = _all_zero_rmse_for_truth(truth_storm)
         n_storm = len(storm_days)
     else:
         rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
@@ -283,8 +272,8 @@ def main():
 
     # -------- Rolling validation (mirrors other models) --------
     # 24h validation
-    df_truth_val_24 = truth_wide_for_val(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
-    df_pred_val_24  = predict_val_roll_sarimax(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
+    df_truth_val_24 = _coerce_ts64(truth_wide_for_val(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY))
+    df_pred_val_24  = _coerce_ts64(predict_val_roll_sarimax(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY))
     if not df_truth_val_24.empty and not df_pred_val_24.empty:
         (rmse_overall_24, zero_val_24,
          rmse_calm_24, zero_calm_24, n_calm_24,
@@ -317,8 +306,8 @@ def main():
         print("[EventEval 24h] Storm-heavy: RMSE=nan (all-zero=nan)")
 
     # 48h validation
-    df_truth_val_48 = truth_wide_for_val(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
-    df_pred_val_48  = predict_val_roll_sarimax(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
+    df_truth_val_48 = _coerce_ts64(truth_wide_for_val(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY))
+    df_pred_val_48  = _coerce_ts64(predict_val_roll_sarimax(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY))
     if not df_truth_val_48.empty and not df_pred_val_48.empty:
         (rmse_overall_48, zero_val_48,
          rmse_calm_48, zero_calm_48, n_calm_48,
@@ -392,8 +381,8 @@ def main():
     # -------- Test RMSEs (mirror other scripts; use demo_evaluate) --------
     df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    zero_rmse_24 = all_zero_rmse_for_truth(df_t24)
-    zero_rmse_48 = all_zero_rmse_for_truth(df_t48)
+    zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
+    zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
     test_rmse_24 = per_county_rmse_mean(df_t24, df24)
     test_rmse_48 = per_county_rmse_mean(df_t48, df48)
