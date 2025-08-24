@@ -600,42 +600,55 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
 
 # ========= NEW: zero/nonzero diagnostic ratios =========
+# ========= REPLACE your _zero_nonzero_ratios with this version =========
 def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame, eps: float = ZERO_EPS):
     """
     Returns (zero->nonzero_ratio, nonzero->zero_ratio)
       zero->nonzero: fraction of true==0 cells where pred>eps  (false positives)
       nonzero->zero: fraction of true>eps cells where pred<=eps (false negatives)
-    Operates only on the intersection of timestamps/locations present in both.
+    Operates on the intersection of timestamps & locations present in both.
+    Robust to duplicate (timestamp, location) rows in df_pred_long.
     """
     if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
         return float("nan"), float("nan")
 
-    # coerce timestamp dtype
+    # ---- Coerce & clean truth (wide) ----
     df_t = df_truth_wide.copy()
     df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
+    tw = df_t.set_index("timestamp").sort_index()
+
+    # ---- Coerce & clean preds (long) ----
     df_p = df_pred_long.copy()
     df_p["timestamp"] = pd.to_datetime(df_p["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_p["location"]  = df_p["location"].astype(str)
+    df_p = df_p.dropna(subset=["timestamp", "location"])
 
-    # pivot predictions to wide
-    pw = df_p.pivot(index="timestamp", columns="location", values="pred")
+    # Collapse duplicate (timestamp, location) pairs (mean)
+    df_p = df_p.groupby(["timestamp", "location"], as_index=False, sort=False)["pred"].mean()
 
-    # align on timestamps
-    df_t = df_t.set_index("timestamp")
-    common_ts = df_t.index.intersection(pw.index)
+    # Pivot with aggregation safety
+    pw = df_p.pivot_table(index="timestamp", columns="location", values="pred", aggfunc="mean")
+    pw = pw.sort_index()
+
+    # ---- Align intersection (timestamps / locations) ----
+    common_ts = tw.index.intersection(pw.index)
     if len(common_ts) == 0:
         return float("nan"), float("nan")
-    tw = df_t.loc[common_ts]
+    tw = tw.loc[common_ts]
+    pw = pw.loc[common_ts]
 
-    # align on locations (columns)
-    loc_truth = [c for c in tw.columns if c != "timestamp"] if "timestamp" in tw.columns else list(tw.columns)
+    # Align locations
+    loc_truth = list(tw.columns)
     loc_pred  = list(pw.columns)
     locs = sorted(set(loc_truth).intersection(loc_pred))
     if len(locs) == 0:
         return float("nan"), float("nan")
 
-    y_true = tw[locs].values
-    y_pred = pw.loc[common_ts, locs].values
+    y_true = tw[locs].to_numpy()
+    y_pred = pw[locs].to_numpy()
 
+    # valid mask
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     if not np.any(valid):
         return float("nan"), float("nan")
@@ -646,11 +659,11 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     true_zero = (np.abs(y_true) <= eps)
     pred_zero = (np.abs(y_pred) <= eps)
 
-    # zero -> nonzero (FP)
+    # zero -> nonzero (false positives among truly zero)
     denom_zero = np.sum(true_zero)
     z_to_nz = np.sum(true_zero & (~pred_zero)) / denom_zero if denom_zero > 0 else float("nan")
 
-    # nonzero -> zero (FN)
+    # nonzero -> zero (false negatives among truly nonzero)
     denom_nz = np.sum(~true_zero)
     nz_to_z = np.sum((~true_zero) & pred_zero) / denom_nz if denom_nz > 0 else float("nan")
 
@@ -1018,7 +1031,8 @@ def main():
         ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
     )
-    mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
+    # mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
+    mdl24 = None
 
     # ==== 48h ====
     X48, Y48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)
