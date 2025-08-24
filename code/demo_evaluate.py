@@ -77,6 +77,10 @@ def long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
     if df_long.empty:
         # produce an empty wide frame with requested columns
         return pd.DataFrame(columns=["timestamp", *locs])
+
+    df_long = df_long.copy()
+    df_long["timestamp"] = pd.to_datetime(df_long["timestamp"], errors="coerce")
+
     pivot = df_long.pivot_table(
         index="timestamp", columns="location", values="pred", aggfunc="sum", fill_value=0.0
     )
@@ -88,6 +92,11 @@ def long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
     return pivot
 
 def per_county_rmse_mean(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame) -> float:
+    df_truth_wide = df_truth_wide.copy()
+    df_pred_long = df_pred_long.copy()
+    df_truth_wide["timestamp"] = pd.to_datetime(df_truth_wide["timestamp"], errors="coerce")
+    df_pred_long["timestamp"] = pd.to_datetime(df_pred_long["timestamp"], errors="coerce")
+
     locs = [c for c in df_truth_wide.columns if c != "timestamp"]
 
     df_pred_wide = long_to_wide(df_pred_long, locs)
