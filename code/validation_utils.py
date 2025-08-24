@@ -80,6 +80,13 @@ def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
                       train_last_day, method, storm_top_q,
                       calm_bottom_q, calm_n, seed):
     """Compute overall, calm-day, and storm-day RMSE blocks."""
+    df_truth_val = df_truth_val.copy()
+    df_pred_val = df_pred_val.copy()
+    if not df_truth_val.empty:
+        df_truth_val["timestamp"] = pd.to_datetime(df_truth_val["timestamp"], errors="coerce")
+    if not df_pred_val.empty:
+        df_pred_val["timestamp"] = pd.to_datetime(df_pred_val["timestamp"], errors="coerce")
+
     rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
     zero_overall = all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
