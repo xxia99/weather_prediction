@@ -16,7 +16,7 @@ OUT_DIR = "results/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
-TRAIN_LAST_DAY = 88  # mirrors other scripts
+TRAIN_LAST_DAY = 80  # mirrors other scripts
 
 def safe_fit_sarimax(y: np.ndarray):
     y = np.asarray(y, dtype=float).flatten()

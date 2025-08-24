@@ -40,7 +40,7 @@ STEM_D_MODEL  = 64     # feature hidden width
 STEM_K_ORDER  = 0      # <<< disable spatial mixing (graph diffusion orders 0..K); K=0 = identity
 STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
-STEM_DROPOUT  = 0.5
+STEM_DROPOUT  = 0.1  # 0.5
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
@@ -421,8 +421,10 @@ class STGNNForecaster(nn.Module):
         h = self.patch(x)
         for blk in self.blocks:
             h = blk(h)
-        pooled = h.mean(dim=1)      # (B, N, STEM_D_MODEL)
-        y = self.readout(pooled)    # (B, N, H)
+        # pooled = h.mean(dim=1)      # (B, N, STEM_D_MODEL)
+        # y = self.readout(pooled)    # (B, N, H)
+        last = h[:, -1]  # (B, N, D) if h is (B, T, N, D)
+        y = self.readout(last)
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------

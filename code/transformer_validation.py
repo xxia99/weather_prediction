@@ -1,7 +1,7 @@
 # Simple shared Seq2Seq per-county forecaster (outage + ALL weather features).
 # Transformer encoder over sliding windows from all counties, then predicts
 # each county's next H hours using only the last SEQ_LEN hours of its own history.
-# Mirrors the split-aware validation/testing/saving logic.
+# Mirrors the split-aware validation/testing/saving logic + calm/storm event eval.
 
 import os
 from tqdm import tqdm
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
-from event_stratified_eval import event_stratified_report
+# NOTE: we no longer need event_stratified_report; we compute calm/storm RMSEs here.
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -34,6 +34,13 @@ DROPOUT      = 0.1
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
 TRAIN_LAST_DAY = 80
+
+# --- Event-stratified validation options (mirrors StemGNN script) ---
+EVENT_METHOD   = "mean"   # or "max"
+STORM_TOP_Q    = 0.80     # top 20% days = stormy
+CALM_BOTTOM_Q  = 0.50     # bottom 50% pool = calm
+CALM_N         = 10       # sample 10 calm days
+BEST_BY        = "overall"  # "overall" | "calm" | "storm"
 
 # ---------------- utils ----------------
 def open_ds(path):
@@ -321,7 +328,94 @@ def _coerce_ts64(df: pd.DataFrame) -> pd.DataFrame:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("datetime64[ns]")
     return df
 
-# -------- unified callback (rolling val + test; save best by val RMSE) --------
+# -------------------- Event selection helpers (calm/storm) --------------------
+def _per_day_outage_score(ds_train, method: str = "mean"):
+    ts = ds_train.timestamp.values
+    days, _, _ = _compute_day_indices(ts)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T, L)
+    df = pd.DataFrame({"day": days, "y": y.mean(axis=1)})
+    if method.lower() == "max":
+        g = df.groupby("day")["y"].max()
+    else:
+        g = df.groupby("day")["y"].mean()
+    max_day = int(days.max())
+    day_score = np.zeros(max_day, dtype=float)
+    day_score[g.index.values - 1] = g.values
+    return days, day_score
+
+def _timestamps_for_days(ts: np.ndarray, select_days: set[int]) -> pd.DatetimeIndex:
+    ts_pd = pd.to_datetime(ts)
+    days, _, _ = _compute_day_indices(ts_pd)
+    mask = np.array([(d in select_days) for d in days], dtype=bool)
+    return pd.DatetimeIndex(ts_pd[mask])
+
+def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
+                               df_pred_long: pd.DataFrame,
+                               ts_subset: pd.DatetimeIndex):
+    df_truth_sel = df_truth_wide[df_truth_wide["timestamp"].isin(ts_subset)].copy()
+    df_pred_sel  = df_pred_long[df_pred_long["timestamp"].isin(ts_subset)].copy()
+    if not df_truth_sel.empty:
+        df_truth_sel["timestamp"] = pd.to_datetime(df_truth_sel["timestamp"])
+    if not df_pred_sel.empty:
+        df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"])
+    return df_truth_sel, df_pred_sel
+
+def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
+                       train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
+    """
+    Returns:
+      (rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm_days,
+       rmse_storm, zero_storm, n_storm_days)
+    """
+    # overall
+    rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
+    zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
+
+    # calm/storm selection
+    rng = np.random.default_rng(seed)
+    ts = ds_train.timestamp.values
+    days, day_score = _per_day_outage_score(ds_train, method=method)
+    last_day = int(days.max())
+    tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
+    if len(tgt_days) == 0:
+        return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
+
+    tgt_scores = day_score[tgt_days - 1]
+    storm_thr = np.quantile(tgt_scores, storm_top_q)
+    calm_thr  = np.quantile(tgt_scores, calm_bottom_q)
+
+    storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
+    calm_pool  = tgt_days[tgt_scores <= calm_thr].tolist()
+    if len(calm_pool) > 0:
+        k = int(min(calm_n, len(calm_pool)))
+        calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
+    else:
+        calm_days = set()
+
+    ts_storm = _timestamps_for_days(ts, storm_days)
+    ts_calm  = _timestamps_for_days(ts, calm_days)
+
+    # calm block
+    if len(ts_calm) > 0:
+        truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
+        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        zero_calm = _all_zero_rmse_for_truth(truth_calm)
+        n_calm = len(calm_days)
+    else:
+        rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
+
+    # storm block
+    if len(ts_storm) > 0:
+        truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
+        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        zero_storm = _all_zero_rmse_for_truth(truth_storm)
+        n_storm = len(storm_days)
+    else:
+        rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
+
+    return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
+
+# -------- unified callback (rolling val + test; save best by BEST_BY) --------
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                               train_last_day=80,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
@@ -329,77 +423,75 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     Evaluate each epoch on rolling day-ahead validation (days 81..end) **and** on the test set.
     Prints:
       - Rolling RMSE=xxx.xxxx (all-zero RMSE=yyy.yyyy)
+      - Calm-heavy & Storm-heavy RMSEs (with all-zero baselines)
       - Testing RMSE=aaa.aaaa (all-zero RMSE=bbb.bbbb)
-    Saves best checkpoint (by validation RMSE).
+    Saves best checkpoint by metric selected via BEST_BY.
     """
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
 
     # all-zero baseline for validation timestamps
-    if not df_truth_val.empty:
-        zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val)
-    else:
-        zero_rmse_val = float("nan")
+    zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
     def _callback(model, epoch):
         # ---- Validation (rolling) ----
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
 
-        # ---------- COERCE TIMESTAMPS BEFORE STRATIFIED REPORT ----------
+        # Coerce timestamps for safety
         df_pred_val = _coerce_ts64(df_pred_val)
         df_truth_val_local = _coerce_ts64(df_truth_val)
 
-        # Event-stratified RMSEs (Calm vs Stormy), after anchor
-        try:
-            event_stratified_report(
-                ds_train,
-                df_truth_val_local,
-                df_pred_val,
-                train_last_day=TRAIN_LAST_DAY,
-                method="mean",
-                storm_top_q=0.80,
-                calm_bottom_q=0.50,
-                calm_n=10,
-                seed=42
-            )
-        except ValueError as e:
-            # One more defensive attempt with explicit dtype alignment
-            print(f"[Val {label}] Note: re-trying event_stratified_report after dtype coercion: {e}")
-            df_pred_val["timestamp"] = pd.to_datetime(df_pred_val["timestamp"]).astype("datetime64[ns]")
-            df_truth_val_local["timestamp"] = pd.to_datetime(df_truth_val_local["timestamp"]).astype("datetime64[ns]")
-            event_stratified_report(
-                ds_train,
-                df_truth_val_local,
-                df_pred_val,
-                train_last_day=TRAIN_LAST_DAY,
-                method="mean",
-                storm_top_q=0.80,
-                calm_bottom_q=0.50,
-                calm_n=10,
-                seed=42
-            )
+        (rmse_overall, zero_overall,
+         rmse_calm, zero_calm, n_calm,
+         rmse_storm, zero_storm, n_storm) = _event_rmse_blocks(
+            ds_train, df_truth_val_local, df_pred_val,
+            train_last_day=train_last_day,
+            method=EVENT_METHOD,
+            storm_top_q=STORM_TOP_Q,
+            calm_bottom_q=CALM_BOTTOM_Q,
+            calm_n=CALM_N,
+            seed=42
+        )
 
-        if df_pred_val.empty or df_truth_val_local.empty:
-            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
+        # Print summary
+        if np.isfinite(rmse_overall):
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse_overall:.4f} (all-zero={zero_overall:.4f})")
         else:
-            rmse = per_county_rmse_mean(df_truth_val_local, df_pred_val)
-            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_val:.4f})")
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero=nan)")
 
-            # Save best by validation RMSE
-            if np.isfinite(rmse) and rmse < best["rmse"]:
-                best["rmse"] = rmse
-                best["epoch"] = epoch
-                save_path = os.path.join(OUT_DIR, f"best_seq2seq_{label}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "label": label,
-                        "rmse": rmse,
-                        "model_state_dict": model.state_dict(),
-                    },
-                    save_path,
-                )
-                print(f"[Val {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+        if np.isfinite(rmse_calm):
+            print(f"[EventEval {label}] Calm-heavy ({n_calm} days): RMSE={rmse_calm:.4f} (all-zero={zero_calm:.4f})")
+        else:
+            print(f"[EventEval {label}] Calm-heavy: RMSE=nan (all-zero=nan)")
+
+        if np.isfinite(rmse_storm):
+            print(f"[EventEval {label}] Storm-heavy ({n_storm} days): RMSE={rmse_storm:.4f} (all-zero={zero_storm:.4f})")
+        else:
+            print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+        # Select best metric
+        metric_map = {"overall": rmse_overall, "calm": rmse_calm, "storm": rmse_storm}
+        sel = metric_map.get(str(BEST_BY).lower(), rmse_overall)
+        sel_val = sel if np.isfinite(sel) else rmse_overall  # fallback to overall if selected is NaN
+
+        if np.isfinite(sel_val) and sel_val < best["rmse"]:
+            best["rmse"] = sel_val
+            best["epoch"] = epoch
+            save_path = os.path.join(OUT_DIR, f"best_seq2seq_{label}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "label": label,
+                    "rmse_select": sel_val,
+                    "rmse_overall": rmse_overall,
+                    "rmse_calm": rmse_calm,
+                    "rmse_storm": rmse_storm,
+                    "best_by": str(BEST_BY).lower(),
+                    "model_state_dict": model.state_dict(),
+                },
+                save_path,
+            )
+            print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
         # ---- Test set evaluation at each validation step ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
@@ -504,10 +596,10 @@ def main():
             ckpt24 = torch.load(best24_path, map_location=DEVICE)
             try:
                 mdl24.load_state_dict(ckpt24["model_state_dict"])
-                rmse24_val = ckpt24.get("rmse", None)
+                rmse24_val = ckpt24.get("rmse_select", ckpt24.get("rmse", None))
                 ep24 = ckpt24.get("epoch", None)
                 if isinstance(rmse24_val, (float, int)):
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val RMSE={rmse24_val:.4f})")
+                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val selected RMSE={rmse24_val:.4f}, best_by={ckpt24.get('best_by','overall')})")
                 else:
                     print(f"[24h] Loaded best checkpoint (epoch {ep24})")
             except Exception as e:
@@ -526,10 +618,10 @@ def main():
             ckpt48 = torch.load(best48_path, map_location=DEVICE)
             try:
                 mdl48.load_state_dict(ckpt48["model_state_dict"])
-                rmse48_val = ckpt48.get("rmse", None)
+                rmse48_val = ckpt48.get("rmse_select", ckpt48.get("rmse", None))
                 ep48 = ckpt48.get("epoch", None)
                 if isinstance(rmse48_val, (float, int)):
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val RMSE={rmse48_val:.4f})")
+                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val selected RMSE={rmse48_val:.4f}, best_by={ckpt48.get('best_by','overall')})")
                 else:
                     print(f"[48h] Loaded best checkpoint (epoch {ep48})")
             except Exception as e:

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
-from event_stratified_eval import event_stratified_report  # <-- added
+# (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -44,24 +44,24 @@ STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
 STEM_DROPOUT  = 0.5
 
 # === Pretrained encoder options (NEW) ===
-# PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst.pt" # e.g., "results_seq/pretrained_patchtst.pt" or None
-# PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask.pt"
-# PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask_contrast.pt"
-# PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_multitask_contrast_freq.pt"
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
 ENCODER_LR              = 2e-5  # smaller LR for encoder fine-tuning
 FREEZE_ENCODER          = True  # if True, keep encoder frozen during training
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
 USE_CB_ENCODER          = True
-# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
-# CB_ENCODER_CKPT         = "results_seq/cb_peft_adapter_tsmix.pt"   # "results_seq/pretrained_cb_encoder_peft_multitask_contrast_freq.pt"
-# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"
 CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 LOSS_HUBER_BETA = 1.0  # Huber delta
+
+# === Event-stratified validation settings (NEW) ===
+EVENT_METHOD   = "mean"   # or "max"
+STORM_TOP_Q    = 0.80     # top 20% days = stormy
+CALM_BOTTOM_Q  = 0.50     # bottom 50% pool = calm
+CALM_N         = 10       # sample 10 calm days
+BEST_BY        = "overall"  # "overall" | "calm" | "storm"
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -164,7 +164,6 @@ class PatchTSTEncoder(nn.Module):
         return h
 
 # -------------------- Chronos-Bolt PEFT encoder (NEW) --------------------
-# Only used when USE_CB_ENCODER=True, otherwise ignored.
 def _discover_lora_targets(model: nn.Module):
     """Find Linear submodule name fragments to target with LoRA; robust to model variants."""
     linear_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
@@ -186,7 +185,6 @@ def _discover_lora_targets(model: nn.Module):
             present = list({n.split(".")[-1] for n in enc_linear})
     if not present:
         present = ["linear"]
-    # unique order-preserving
     seen, final = set(), []
     for s in present:
         if s not in seen:
@@ -208,9 +206,8 @@ class ChronosBoltEncoderPEFT(nn.Module):
         cb_model_name = ck.get("cb_model_name", "amazon/chronos-bolt-mini")
         d_out         = int(ck.get("d_out", 64))
         self.in_channels = int(ck.get("in_channels", in_channels))
-        self.d_model = d_out  # for compatibility with downstream code expecting .d_model
+        self.d_model = d_out  # for downstream code expecting .d_model
 
-        # lazy imports to avoid dependency if not used
         try:
             from transformers import AutoModel, AutoConfig
             from peft import LoraConfig, get_peft_model
@@ -234,14 +231,12 @@ class ChronosBoltEncoderPEFT(nn.Module):
         )
         backbone = get_peft_model(backbone, lcfg)
 
-        # Small IO adapters (same shapes as in pretraining)
         hidden_dim = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
         if hidden_dim is None:
             raise RuntimeError("Cannot determine Chronos hidden size from config.")
         self.embed_proj = nn.Linear(self.in_channels, hidden_dim)
         self.post_proj  = nn.Linear(hidden_dim, self.d_model)
 
-        # Load full wrapper state dict
         self.backbone = backbone
         self.load_state_dict(ck["state_dict"], strict=True)
         print(f"[CB Encoder] Loaded PEFT encoder from: {ckpt_path} | d_out={self.d_model}")
@@ -255,7 +250,6 @@ class ChronosBoltEncoderPEFT(nn.Module):
         emb  = self.embed_proj(x_bn)                           # (B*N, T, H)
         attn_mask = torch.ones(B * N, T, dtype=torch.long, device=emb.device)
 
-        # T5-like: use encoder(inputs_embeds=...)
         if hasattr(self.backbone, "encoder") and callable(self.backbone.encoder):
             out = self.backbone.encoder(
                 inputs_embeds=emb, attention_mask=attn_mask, output_hidden_states=True
@@ -267,7 +261,6 @@ class ChronosBoltEncoderPEFT(nn.Module):
             )
             h_bn = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
-        # time alignment
         if h_bn.size(1) > T:
             h_bn = h_bn[:, :T, :]
         elif h_bn.size(1) < T:
@@ -306,7 +299,6 @@ class _AdaptiveAdjacency(nn.Module):
         self.E = nn.Parameter(torch.randn(num_nodes, d_emb))
 
     def forward(self):
-        # A = softmax(ReLU(E E^T)) row-wise
         E = self.E
         A = torch.relu(E @ E.t())               # (N, N)
         A = torch.softmax(A, dim=1)
@@ -324,11 +316,9 @@ class _GraphDiffusion(nn.Module):
     def forward(self, x, A):
         # x: (B, T, N, C), A: (N, N)
         B, T, N, C = x.shape
-        # Precompute powers of A
         A_pows = [torch.eye(N, device=x.device, dtype=x.dtype), A]
         for _ in range(2, self.k_order + 1):
             A_pows.append(A_pows[-1] @ A)
-        # Diffusion sum_k alpha_k * (A^k X)
         agg = 0.0
         for k, Ak in enumerate(A_pows):
             y = torch.einsum('ij,btjc->btic', Ak, x)   # (B, T, N, C)
@@ -368,12 +358,10 @@ class STGNNForecaster(nn.Module):
         self.horizon     = horizon
         self.in_channels = in_channels
 
-        # Encoder choice
         if USE_CB_ENCODER and os.path.exists(CB_ENCODER_CKPT):
             self.patch = ChronosBoltEncoderPEFT(in_channels=in_channels, ckpt_path=CB_ENCODER_CKPT)
             print("[Encoder] Using Chronos-Bolt PEFT encoder.")
         else:
-            # Patch encoder (per-node)
             self.patch = PatchTSTEncoder(
                 in_channels=in_channels,
                 patch_len=PATCH_LEN,
@@ -384,7 +372,6 @@ class STGNNForecaster(nn.Module):
                 dropout=PATCH_DROPOUT,
                 ff=PATCH_FF
             )
-            # Optional: load pretrained PatchTST encoder weights
             if PRETRAINED_ENCODER_PATH is not None and os.path.exists(PRETRAINED_ENCODER_PATH):
                 try:
                     ckpt = torch.load(PRETRAINED_ENCODER_PATH, map_location="cpu")
@@ -394,13 +381,11 @@ class STGNNForecaster(nn.Module):
                 except Exception as e:
                     print(f"[Encoder] Warning: failed to load pretrained PatchTST: {e}")
 
-        # Optionally freeze encoder
         if FREEZE_ENCODER:
             for p in self.patch.parameters():
                 p.requires_grad = False
             print("[Encoder] Frozen (no fine-tuning).")
 
-        # Stem blocks start from actual encoder output dim
         enc_out_dim = getattr(self.patch, "d_model", PATCH_D_MODEL)
         blocks = []
         d_in = enc_out_dim
@@ -425,30 +410,19 @@ class STGNNForecaster(nn.Module):
         assert N == self.num_nodes and F == self.in_channels, \
             f"StemGNN input shape mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
 
-        # Encoder to (B, T, N, enc_out_dim)
         h = self.patch(x)
-
-        # Spatio-temporal Stem blocks
         for blk in self.blocks:
-            h = blk(h)              # (B, T, N, STEM_D_MODEL)
-
-        # mean temporal pooling (more robust than last-step only)
+            h = blk(h)
         pooled = h.mean(dim=1)      # (B, N, STEM_D_MODEL)
         y = self.readout(pooled)    # (B, N, H)
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------
 def _compute_day_indices(ts: np.ndarray):
-    """
-    Map each timestamp to a day index starting at 1.
-    Returns: days (T,), unique_days (list[pd.Timestamp]), day_end_idx (list[int])
-    """
     ts_pd = pd.to_datetime(ts)
     days_norm = ts_pd.normalize()
     uniq = days_norm.unique()
-    # sort to be sure
     uniq = pd.DatetimeIndex(sorted(uniq))
-    # map day number starting at 1
     day_map = {d: i+1 for i, d in enumerate(uniq)}
     days = np.array([day_map[d] for d in days_norm], dtype=int)
     day_end_idx = []
@@ -528,9 +502,9 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80):
     Returns a long df with columns [timestamp, location, pred] for ALL validation days.
     """
     model.eval()
-    X_all = aux["X_all_scaled"]           # (T, N, Din), scaled with train scalers
-    ts    = aux["timestamps"]             # (T,)
-    days  = aux["days"]                   # (T,)
+    X_all = aux["X_all_scaled"]           # (T, N, Din)
+    ts    = aux["timestamps"]
+    days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
     N = X_all.shape[1]
     locs = list(map(str, ds_train.location.values))
@@ -538,18 +512,17 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80):
     rows = []
     last_day = int(days.max())
     for d in range(train_last_day, last_day):
-        end_idx = day_end_idx[d - 1]           # last index of day d
+        end_idx = day_end_idx[d - 1]
         start_ctx = end_idx - (SEQ_LEN - 1)
         fut_start = end_idx + 1
         fut_end   = fut_start + horizon - 1
         if start_ctx < 0 or fut_end >= len(ts):
-            continue  # skip if not enough context or future overflow
+            continue
 
-        Xin = X_all[start_ctx:end_idx+1, :, :]            # (SEQ_LEN, N, Din)
-        Xin = Xin.reshape(1, SEQ_LEN, N, X_all.shape[2])  # (1, SEQ_LEN, N, Din)
+        Xin = X_all[start_ctx:end_idx+1, :, :]
+        Xin = Xin.reshape(1, SEQ_LEN, N, X_all.shape[2])
 
-        pred_sc = infer(model, Xin)[0]                    # (N, H) scaled
-        # invert scaling to original
+        pred_sc = infer(model, Xin)[0]                    # (N, H)
         y_mu = float(scalers["y_mu"].flatten()[0])
         y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
         pred = (pred_sc * y_sd) + y_mu
@@ -609,66 +582,171 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     })
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
 
+# ---- helpers for event selection (calm/storm) ----
+def _per_day_outage_score(ds_train, method: str = "mean"):
+    ts = ds_train.timestamp.values
+    days, _, _ = _compute_day_indices(ts)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T, N)
+    df = pd.DataFrame({"day": days, "y": y.mean(axis=1)})
+    if method.lower() == "max":
+        g = df.groupby("day")["y"].max()
+    else:
+        g = df.groupby("day")["y"].mean()
+    max_day = int(days.max())
+    day_score = np.zeros(max_day, dtype=float)
+    day_score[g.index.values - 1] = g.values
+    return days, day_score
+
+def _timestamps_for_days(ts: np.ndarray, select_days: set[int]) -> pd.DatetimeIndex:
+    ts_pd = pd.to_datetime(ts)
+    days, _, _ = _compute_day_indices(ts_pd)
+    mask = np.array([ (d in select_days) for d in days ], dtype=bool)
+    return pd.DatetimeIndex(ts_pd[mask])
+
+def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
+                               df_pred_long: pd.DataFrame,
+                               ts_subset: pd.DatetimeIndex):
+    df_truth_sel = df_truth_wide[df_truth_wide["timestamp"].isin(ts_subset)].copy()
+    df_pred_sel  = df_pred_long[df_pred_long["timestamp"].isin(ts_subset)].copy()
+    # enforce dtype to avoid merge issues in per_county_rmse_mean
+    if not df_truth_sel.empty:
+        df_truth_sel["timestamp"] = pd.to_datetime(df_truth_sel["timestamp"])
+    if not df_pred_sel.empty:
+        df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"])
+    return df_truth_sel, df_pred_sel
+
+def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
+                       train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
+    """
+    Returns:
+      (rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm_days,
+       rmse_storm, zero_storm, n_storm_days)
+    """
+    # overall
+    rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
+    zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
+
+    # calm/storm selection
+    rng = np.random.default_rng(seed)
+    ts = ds_train.timestamp.values
+    days, day_score = _per_day_outage_score(ds_train, method=method)
+    last_day = int(days.max())
+    tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
+    if len(tgt_days) == 0:
+        return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
+
+    tgt_scores = day_score[tgt_days - 1]
+    storm_thr = np.quantile(tgt_scores, storm_top_q)
+    calm_thr  = np.quantile(tgt_scores, calm_bottom_q)
+
+    storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
+    calm_pool  = tgt_days[tgt_scores <= calm_thr].tolist()
+    if len(calm_pool) > 0:
+        k = int(min(calm_n, len(calm_pool)))
+        calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
+    else:
+        calm_days = set()
+
+    ts_storm = _timestamps_for_days(ts, storm_days)
+    ts_calm  = _timestamps_for_days(ts, calm_days)
+
+    # calm block
+    if len(ts_calm) > 0:
+        truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
+        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        zero_calm = _all_zero_rmse_for_truth(truth_calm)
+        n_calm = len(calm_days)
+    else:
+        rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
+
+    # storm block
+    if len(ts_storm) > 0:
+        truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
+        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        zero_storm = _all_zero_rmse_for_truth(truth_storm)
+        n_storm = len(storm_days)
+    else:
+        rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
+
+    return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
+
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                               train_last_day=80,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
     """
     Evaluate each epoch on rolling day-ahead validation (days 81..end) **and** on the test set.
     Prints:
-      - Rolling RMSE=xxx.xxxx (all-zero RMSE=yyy.yyyy)
-      - Testing RMSE=aaa.aaaa (all-zero RMSE=bbb.bbbb)
-    Saves best checkpoint (by validation RMSE) like before.
+      - Rolling RMSE and all-zero baseline
+      - Calm-heavy & Storm-heavy RMSEs + all-zero baselines
+      - Testing RMSE (with all-zero baseline)
+    Saves best checkpoint by metric selected via BEST_BY.
     """
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
 
-    # Pre-build an all-zero baseline for validation timestamps/locations
-    if not df_truth_val.empty:
-        zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val)
-    else:
-        zero_rmse_val = float("nan")
+    zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
     def _callback(model, epoch):
-        # ---- Validation (rolling) ----
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
 
-        # Calm/Storm event-stratified validation (added)
-        event_stratified_report(
-            ds_train,
-            df_truth_val,
-            df_pred_val,
-            train_last_day=TRAIN_LAST_DAY,
-            method="mean",          # or "max"
-            storm_top_q=0.80,       # top 20% days as stormy
-            calm_bottom_q=0.50,     # bottom 50% as calm pool
-            calm_n=10,              # sample 10 calm days
+        # event-stratified metrics (with all-zero baselines)
+        (rmse_overall, zero_overall,
+         rmse_calm, zero_calm, n_calm,
+         rmse_storm, zero_storm, n_storm) = _event_rmse_blocks(
+            ds_train, df_truth_val, df_pred_val,
+            train_last_day=train_last_day,
+            method=EVENT_METHOD,
+            storm_top_q=STORM_TOP_Q,
+            calm_bottom_q=CALM_BOTTOM_Q,
+            calm_n=CALM_N,
             seed=42
         )
 
-        if df_pred_val.empty or df_truth_val.empty:
-            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
-            # still compute test if requested
+        # Print nicely
+        if np.isfinite(rmse_overall):
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse_overall:.4f} (all-zero={zero_overall:.4f})")
         else:
-            rmse = per_county_rmse_mean(df_truth_val, df_pred_val)
-            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_val:.4f})")
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero=nan)")
 
-            # Save best by validation RMSE
-            if np.isfinite(rmse) and rmse < best["rmse"]:
-                best["rmse"] = rmse
-                best["epoch"] = epoch
-                save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "label": label,
-                        "rmse": rmse,
-                        "model_state_dict": model.state_dict(),
-                    },
-                    save_path,
-                )
-                print(f"[Val {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+        if np.isfinite(rmse_calm):
+            print(f"[EventEval {label}] Calm-heavy ({n_calm} days): RMSE={rmse_calm:.4f} (all-zero={zero_calm:.4f})")
+        else:
+            print(f"[EventEval {label}] Calm-heavy: RMSE=nan (all-zero=nan)")
 
-        # ---- Test set evaluation at each validation step (NEW) ----
+        if np.isfinite(rmse_storm):
+            print(f"[EventEval {label}] Storm-heavy ({n_storm} days): RMSE={rmse_storm:.4f} (all-zero={zero_storm:.4f})")
+        else:
+            print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+        # Which metric selects "best"?
+        metric_map = {
+            "overall": rmse_overall,
+            "calm": rmse_calm,
+            "storm": rmse_storm
+        }
+        sel = metric_map.get(str(BEST_BY).lower(), rmse_overall)
+        sel_val = sel if np.isfinite(sel) else rmse_overall  # fallback to overall if selected is nan
+
+        if np.isfinite(sel_val) and sel_val < best["rmse"]:
+            best["rmse"] = sel_val
+            best["epoch"] = epoch
+            save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "label": label,
+                    "rmse_select": sel_val,
+                    "rmse_overall": rmse_overall,
+                    "rmse_calm": rmse_calm,
+                    "rmse_storm": rmse_storm,
+                    "best_by": str(BEST_BY).lower(),
+                    "model_state_dict": model.state_dict(),
+                },
+                save_path,
+            )
+            print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
+
+        # ---- Test set evaluation at each validation step ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
             rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
@@ -689,13 +767,11 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
     model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
 
-    # Param groups: smaller LR for encoder (unless frozen)
     enc_params = list(model.patch.parameters())
     enc_ids = set(id(p) for p in enc_params)
     other_params = [p for p in model.parameters() if id(p) not in enc_ids]
 
     if FREEZE_ENCODER:
-        # Encoder params are frozen; optimize only decoder
         opt = torch.optim.Adam(other_params, lr=LR, weight_decay=WEIGHT_DECAY)
     else:
         opt = torch.optim.Adam(
@@ -706,8 +782,6 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             weight_decay=WEIGHT_DECAY
         )
 
-    loss_fn = nn.MSELoss()
-    # loss_fn = nn.SmoothL1Loss(beta=1.0)
     loss_fn = nn.SmoothL1Loss(beta=LOSS_HUBER_BETA)
 
     for epoch in range(EPOCHS):
@@ -717,7 +791,6 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
         for xb, yb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)  # xb: (B, T, N, F), yb: (B, N, H)
 
-            # === Temporal Dropout — randomly zero a few timesteps per window ===
             if TEMPORAL_DROP_PROB > 0.0:
                 with torch.no_grad():
                     drop_mask = (torch.rand(xb.size(0), xb.size(1), 1, 1, device=xb.device) < TEMPORAL_DROP_PROB).float()
@@ -751,9 +824,6 @@ def infer(model, Xin):
 
 # ---------------- pipeline helpers (train windows only) ----------------
 def prepare_training(ds_train, horizon):
-    """
-    (Kept for compatibility but now calls the split-aware builder.)
-    """
     X, Y, Din, scalers, aux = prepare_training_split(ds_train, horizon, TRAIN_LAST_DAY)
     return X, Y, Din, scalers, aux
 
@@ -768,13 +838,12 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     T, N, F = w.shape
     Din = 1 + F
 
-    # Scale inputs with train scalers
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)    # (T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, F)
 
     X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)   # (T, N, Din)
-    Xin = X_all[-SEQ_LEN:]                                    # (SEQ_LEN, N, Din)
-    Xin = Xin.reshape(1, SEQ_LEN, N, Din)                     # (1, SEQ_LEN, N, Din)
+    Xin = X_all[-SEQ_LEN:]
+    Xin = Xin.reshape(1, SEQ_LEN, N, Din)
 
     pred_sc = infer(model, Xin)[0]                            # (N, H)
 
@@ -818,29 +887,19 @@ def main():
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
     ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # ds_train = open_ds(os.path.join(SPLIT_DIR, "train_50days.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
 
-    # Ensure features exist (and implicitly use all of them)
     _ = get_all_features(ds_train)
 
-    # Horizons and timestamps (for test eval; unchanged)
     ts24 = pd.to_datetime(ds_test24.timestamp.values)
     ts48 = pd.to_datetime(ds_test48.timestamp.values)
     H24, H48 = len(ts24), len(ts48)
 
-    # Truth data for test (wide)
     df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
 
-    # Pre-compute all-zero RMSE for test sets (NEW)
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
-    # Train two models (24h, 48h) with split-aware training and rolling validation + test-at-val
     # ==== 24h ====
     X24, Y24, Din, scalers24, aux24 = prepare_training(ds_train, horizon=H24)
     n_nodes = ds_train.sizes["location"]
@@ -858,7 +917,7 @@ def main():
     )
     mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
 
-    # ----- Test evaluation using best models, then write CSVs (keep previous behavior) -----
+    # ----- Test evaluation using best models, then write CSVs -----
     # 24h
     if mdl24 is not None:
         best24_path = os.path.join(OUT_DIR, "best_enc-dec_24h.pt")
@@ -866,17 +925,15 @@ def main():
             ckpt24 = torch.load(best24_path, map_location=DEVICE)
             try:
                 mdl24.load_state_dict(ckpt24["model_state_dict"])
-                rmse24_val = ckpt24.get("rmse", None)
+                rmse24_val = ckpt24.get("rmse_select", ckpt24.get("rmse", None))
                 ep24 = ckpt24.get("epoch", None)
                 if isinstance(rmse24_val, (float, int)):
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val RMSE={rmse24_val:.4f})")
+                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val selected RMSE={rmse24_val:.4f}, best_by={ckpt24.get('best_by','overall')})")
                 else:
                     print(f"[24h] Loaded best checkpoint (epoch {ep24})")
             except Exception as e:
                 print(f"[24h] Warning: failed to load best checkpoint: {e}")
-        # Predict on test set
         df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24)
-        # Compute test RMSE vs truth and print with all-zero baseline
         test_rmse_24 = per_county_rmse_mean(df_t24, df24)
         print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
     else:
@@ -889,23 +946,21 @@ def main():
             ckpt48 = torch.load(best48_path, map_location=DEVICE)
             try:
                 mdl48.load_state_dict(ckpt48["model_state_dict"])
-                rmse48_val = ckpt48.get("rmse", None)
+                rmse48_val = ckpt48.get("rmse_select", ckpt48.get("rmse", None))
                 ep48 = ckpt48.get("epoch", None)
                 if isinstance(rmse48_val, (float, int)):
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val RMSE={rmse48_val:.4f})")
+                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val selected RMSE={rmse48_val:.4f}, best_by={ckpt48.get('best_by','overall')})")
                 else:
                     print(f"[48h] Loaded best checkpoint (epoch {ep48})")
             except Exception as e:
                 print(f"[48h] Warning: failed to load best checkpoint: {e}")
-        # Predict on test set
         df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48)
-        # Compute test RMSE vs truth and print with all-zero baseline
         test_rmse_48 = per_county_rmse_mean(df_t48, df48)
         print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
     else:
         df48 = None
 
-    # Fallbacks (shouldn't trigger)
+    # Fallbacks
     if df24 is None:
         locs = list(map(str, ds_train.location.values))
         df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
@@ -917,7 +972,6 @@ def main():
                              "location": np.tile(locs, len(ts48)),
                              "pred": 0.0})
 
-    # Save test predictions (unchanged; now after the printed RMSEs)
     out24 = os.path.join(OUT_DIR, "stemgnn_pred_24h.csv")
     out48 = os.path.join(OUT_DIR, "stemgnn_pred_48h.csv")
     df24.to_csv(out24, index=False)
@@ -927,7 +981,6 @@ def main():
     print(f"  {out24}")
     print(f"  {out48}")
 
-    # Clean up
     ds_train.close(); ds_test24.close(); ds_test48.close()
 
 if __name__ == "__main__":

@@ -14,15 +14,15 @@ from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 # Config
 # =========================
 SPLIT_DIR   = "data/"
-OUT_DIR     = "results_lora/"
+OUT_DIR     = "results_lora_new/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-DEVICE = "cuda:3" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 
 # Windows / data
 SEQ_LEN     = 24     # context length T (match downstream)
 H_PRE       = 24     # pretraining forecast horizon H
-BATCH_SIZE  = 1024     # batch size for training
+BATCH_SIZE  = 512   # batch size for training
 
 # Training
 EPOCHS          = 100
@@ -42,56 +42,54 @@ VIEW_SPAN_LEN           = 3
 
 # ---------- Contrastive (InfoNCE) ----------
 USE_CONTRASTIVE         = True
-W_CONTRAST              = 1.0      # weight of contrastive loss
-TAU                     = 0.2      # temperature for InfoNCE
-ADD_JITTER_STD          = 0.01     # small Gaussian jitter std for views
-ADD_DROPOUT_PROB        = 0.0      # channel dropout prob for views
-# If you want contrastive gradients to update the encoder, set to True
+W_CONTRAST              = 1.0
+TAU                     = 0.2
+ADD_JITTER_STD          = 0.01
+ADD_DROPOUT_PROB        = 0.0
 CONTRAST_UPDATES_ENCODER = False
 
-# ---------- Frequency-domain augmentations (TimesNet-style) ----------
+# ---------- Frequency-domain augmentations ----------
 USE_FREQ_AUG            = True
-FREQ_AUG_PROB           = 0.8      # chance to apply frequency aug per view
-FREQ_AMP_STD            = 0.10     # multiplicative magnitude noise ~ N(1, std)
-FREQ_PHASE_STD          = 0.20     # phase jitter (radians) ~ N(0, std)
-FREQ_DROPOUT_FRAC       = 0.10     # fraction of frequency bins to zero
-FREQ_DROPOUT_PROB       = 0.5      # prob of applying spectral dropout
-FREQ_BAND_PROB          = 0.5      # prob of band-stop (else band-keep) op
-FREQ_BAND_WIDTH_RATIO   = (0.05, 0.25)  # width as fraction of Nyquist [min, max]
-FREQ_SHELF_PROB         = 0.3      # prob of applying high/low shelf attenuation
-FREQ_SHELF_STRENGTH     = (0.3, 0.8)    # attenuation factor range
+FREQ_AUG_PROB           = 0.8
+FREQ_AMP_STD            = 0.10
+FREQ_PHASE_STD          = 0.20
+FREQ_DROPOUT_FRAC       = 0.10
+FREQ_DROPOUT_PROB       = 0.5
+FREQ_BAND_PROB          = 0.5
+FREQ_BAND_WIDTH_RATIO   = (0.05, 0.25)
+FREQ_SHELF_PROB         = 0.3
+FREQ_SHELF_STRENGTH     = (0.3, 0.8)
 
 # ---------- Multitask loss weights ----------
-W_SSL       = 1.0   # masked reconstruction loss weight
-W_FORECAST  = 1.0   # next-H forecasting loss weight
-# Extra emphasis on outage channel (index 0)
+W_SSL       = 1.0
+W_FORECAST  = 1.0
 W_OUTAGE_SSL      = 0.5
 W_OUTAGE_FORECAST = 1.0
 
 # ---------- CB + PEFT (LoRA) ----------
-CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"  # or a local path / HF id
+CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"
 D_OUT           = 64
 LORA_R          = 8
 LORA_ALPHA      = 16
 LORA_DROPOUT    = 0.05
 
 # ---------- Train/Val split by days ----------
-TRAIN_LAST_DAY = 80  # use days 1..80 for training; 81..end for day-ahead validation
+TRAIN_LAST_DAY = 80
 
-# ---------- Event-stratified validation (Calm/Storm + all-zero baselines) ----------
-EVENT_METHOD   = "mean"   # or "max" for day score
-STORM_TOP_Q    = 0.80     # top 20% days considered "stormy"
-CALM_BOTTOM_Q  = 0.50     # bottom 50% pool for calm sampling
-CALM_N         = 10       # sample 10 calm days
+# ---------- Event-stratified validation ----------
+EVENT_METHOD   = "mean"
+STORM_TOP_Q    = 0.80
+CALM_BOTTOM_Q  = 0.50
+CALM_N         = 10
 BEST_BY        = "overall"  # "overall" | "calm" | "storm" | "loss"
 
-# ---------- TSMixup (NEW) ----------
-TSMIXUP_PROB       = 0.5     # chance to apply per batch
-TSMIXUP_K_MAX      = 3       # mix up to K series
-TSMIXUP_ALPHA      = 1.5     # Dirichlet concentration
-TSMIXUP_SEGMENT    = False   # if True, mix only a contiguous time slice
-TSMIXUP_LEN_FRAC   = (0.5, 1.0)  # segment length as fraction of T (and mapped to H)
-TSMIXUP_EPS        = 1e-6    # numerical stability for scaling
+# ---------- TSMixup ----------
+TSMIXUP_PROB       = 0.5
+TSMIXUP_K_MAX      = 3
+TSMIXUP_ALPHA      = 1.5
+TSMIXUP_SEGMENT    = False
+TSMIXUP_LEN_FRAC   = (0.5, 1.0)
+TSMIXUP_EPS        = 1e-6
 
 # ---------- Storm-weighted sampling ----------
 STORM_SAMPLING         = True
@@ -101,9 +99,8 @@ STORM_MIN_WEIGHT       = 0.1
 # ---------- Steps-per-epoch expansion ----------
 EPOCH_EXPANSION = 2.0
 
-# Save path (wrapper state_dict)
+# Save paths
 SAVE_PATH = os.path.join(OUT_DIR, f"pretrained_cb_encoder_peft_independent_H{H_PRE}.pt")
-# Optional: export LoRA adapter/backbone in HF format
 SAVE_ADAPTER_DIR = os.path.join(OUT_DIR, f"cb_peft_adapter_independent_H{H_PRE}")
 
 # =========================
@@ -136,12 +133,6 @@ def channel_mse(pred, target, mask=None, ch=0):
 # Data prep (independent locations)
 # =========================
 def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last_day=80):
-    """
-    Build training windows for **independent locations**:
-      X_tr: (nW*N, seq_len, 1, Din)
-      Y_tr: (nW*N, horizon, 1, Din)
-    Fit scalers on training portion only (days <= train_last_day).
-    """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
     ts = pd.to_datetime(ds_train.timestamp.values)
@@ -150,11 +141,10 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
     T, N, F = w.shape
     Din = 1 + F
 
-    # train-only scalers
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
-    y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)    # (T, N)
-    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                             # (T, N, Din)
+    y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
+    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
 
     nW_total = T - seq_len - horizon + 1
     if nW_total <= 0:
@@ -165,37 +155,31 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
 
     X_list, Y_list = [], []
     for node in range(N):
-        x_loc = X_all[:, node, :]  # (T, Din)
-        # build all windows then trim to train range
-        Xw = np.stack([x_loc[i:i+seq_len] for i in range(nW_total)], axis=0)                  # (nW_total, seq_len, Din)
-        Yw = np.stack([X_all[i+seq_len:i+seq_len+horizon, node, :] for i in range(nW_total)], axis=0)  # (nW_total, H, Din)
+        x_loc = X_all[:, node, :]
+        Xw = np.stack([x_loc[i:i+seq_len] for i in range(nW_total)], axis=0)
+        Yw = np.stack([X_all[i+seq_len:i+seq_len+horizon, node, :] for i in range(nW_total)], axis=0)
         if nW_train > 0:
-            X_list.append(Xw[:nW_train][:, :, None, :])   # (nW_train, seq_len, 1, Din)
-            Y_list.append(Yw[:nW_train][:, :, None, :])   # (nW_train, H, 1, Din)
+            X_list.append(Xw[:nW_train][:, :, None, :])
+            Y_list.append(Yw[:nW_train][:, :, None, :])
 
     if not X_list:
         X_tr = np.empty((0, seq_len, 1, Din), dtype=float)
         Y_tr = np.empty((0, horizon, 1, Din), dtype=float)
     else:
-        X_tr = np.concatenate(X_list, axis=0)  # (nW_train*N, seq_len, 1, Din)
-        Y_tr = np.concatenate(Y_list, axis=0)  # (nW_train*N, H, 1, Din)
+        X_tr = np.concatenate(X_list, axis=0)
+        Y_tr = np.concatenate(Y_list, axis=0)
 
     aux = {
-        "X_all_scaled": X_all,     # (T, N, Din)
-        "y_scaled": y_sc,          # (T, N)
-        "timestamps": ts,          # (T,)
-        "days": days,              # (T,)
-        "day_end_idx": day_end_idx # list[int]
+        "X_all_scaled": X_all,
+        "y_scaled": y_sc,
+        "timestamps": ts,
+        "days": days,
+        "day_end_idx": day_end_idx
     }
     return X_tr, Y_tr, Din, scalers, aux
 
 def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
-    """
-    Day-ahead validation windows for **independent locations**:
-      Xv: (nDays*N, seq_len, 1, Din)
-      Yv: (nDays*N, horizon, 1, Din)
-    """
-    X_all = aux["X_all_scaled"]           # (T, N, Din)
+    X_all = aux["X_all_scaled"]
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
@@ -210,7 +194,6 @@ def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
         fut_end   = fut_start + horizon - 1
         if start_ctx < 0 or fut_end >= T:
             continue
-        # per-county
         for node in range(N):
             ctx = X_all[start_ctx:end_idx+1, node, :].reshape(seq_len, 1, Din)
             fut = X_all[fut_start:fut_start+horizon, node, :].reshape(horizon, 1, Din)
@@ -220,8 +203,8 @@ def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
     if not Xv:
         return (np.empty((0, seq_len, 1, Din), dtype=float),
                 np.empty((0, horizon, 1, Din), dtype=float))
-    Xv = np.stack(Xv, axis=0)  # (nD*N, seq_len, 1, Din)
-    Yv = np.stack(Yv, axis=0)  # (nD*N, horizon, 1, Din)
+    Xv = np.stack(Xv, axis=0)
+    Yv = np.stack(Yv, axis=0)
     return Xv, Yv
 
 # =========================
@@ -292,44 +275,28 @@ def _discover_lora_targets(model: nn.Module):
     return final
 
 class ChronosBoltEncoderPEFT(nn.Module):
-    """
-    Wrap a Chronos/Chronos-Bolt backbone with LoRA (PEFT) and simple
-    input/output adapters to produce (B, T, N, D_OUT) embeddings.
-    """
     def __init__(self, in_channels, cb_model_name=CB_MODEL_NAME, d_out=D_OUT,
                  lora_r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT):
         super().__init__()
         if not HAVE_TRANSFORMERS:
-            raise ImportError(
-                f"transformers not available: {_transformers_err}\n"
-                "Install: pip install transformers accelerate safetensors"
-            )
+            raise ImportError(f"transformers not available: {_transformers_err}")
         if not HAVE_PEFT:
-            raise ImportError(
-                f"peft not available: {_peft_err}\n"
-                "Install: pip install peft"
-            )
+            raise ImportError(f"peft not available: {_peft_err}")
 
         self.in_channels = in_channels
         self.d_out = d_out
 
         self.config = AutoConfig.from_pretrained(cb_model_name, trust_remote_code=True)
         self.backbone = AutoModel.from_pretrained(
-            cb_model_name,
-            trust_remote_code=True,
-            output_hidden_states=True
+            cb_model_name, trust_remote_code=True, output_hidden_states=True
         )
 
         targets = _discover_lora_targets(self.backbone)
         print(f"[PEFT] LoRA targets: {targets}")
 
         lcfg = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=targets,
-            bias="none",
-            task_type="FEATURE_EXTRACTION",
+            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            target_modules=targets, bias="none", task_type="FEATURE_EXTRACTION",
         )
         try:
             self.backbone = get_peft_model(self.backbone, lcfg)
@@ -338,9 +305,7 @@ class ChronosBoltEncoderPEFT(nn.Module):
             lcfg.target_modules = ["linear"]
             self.backbone = get_peft_model(self.backbone, lcfg)
 
-        hidden_dim = getattr(self.config, "hidden_size", None)
-        if hidden_dim is None:
-            hidden_dim = getattr(self.config, "d_model", None)
+        hidden_dim = getattr(self.config, "hidden_size", None) or getattr(self.config, "d_model", None)
         if hidden_dim is None:
             raise RuntimeError("Cannot determine Chronos hidden size from config.")
 
@@ -356,17 +321,9 @@ class ChronosBoltEncoderPEFT(nn.Module):
         attn_mask = torch.ones(B * N, T, dtype=torch.long, device=emb.device)
 
         if hasattr(self.backbone, "encoder") and callable(self.backbone.encoder):
-            out = self.backbone.encoder(
-                inputs_embeds=emb,
-                attention_mask=attn_mask,
-                output_hidden_states=True,
-            )
+            out = self.backbone.encoder(inputs_embeds=emb, attention_mask=attn_mask, output_hidden_states=True)
         else:
-            out = self.backbone(
-                inputs_embeds=emb,
-                attention_mask=attn_mask,
-                output_hidden_states=True,
-            )
+            out = self.backbone(inputs_embeds=emb, attention_mask=attn_mask, output_hidden_states=True)
 
         if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
             h_bn = out.last_hidden_state
@@ -404,12 +361,6 @@ class ChronosBoltEncoderPEFT(nn.Module):
 # Multi-task model using CB encoder
 # =========================
 class MultiTaskCBEncoder(nn.Module):
-    """
-    Encoder + heads:
-      - recon_head: reconstruct inputs at masked timesteps (SSL)
-      - forecast_head: predict next H steps of full multivariate inputs
-      - proj_head: projection for InfoNCE (contrastive)
-    """
     def __init__(self, in_channels, horizon):
         super().__init__()
         self.horizon = horizon
@@ -581,7 +532,7 @@ def _dirichlet_weights(batch_size, k, alpha, device):
         w = torch.ones(batch_size, 1, device=device)
     else:
         w = torch.distributions.Dirichlet(alpha * torch.ones(k, device=device)).sample((batch_size,))
-    return w  # (B, k)
+    return w
 
 def _gather_k_partners(x, k, device):
     B = x.size(0)
@@ -689,7 +640,7 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
     days, _, _ = _compute_day_indices(ts)
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T, N)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     df = pd.DataFrame({"day": days, "y": y.mean(axis=1)})
     if method.lower() == "max":
         g = df.groupby("day")["y"].max()
@@ -719,11 +670,6 @@ def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
 
 def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
                        train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
-    """
-    Returns:
-      (rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm_days,
-       rmse_storm, zero_storm, n_storm_days)
-    """
     rmse_overall = _per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
     zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
@@ -788,7 +734,7 @@ def _truth_wide_for_val(ds_train, aux, horizon, train_last_day=80) -> pd.DataFra
     fut_indices = sorted(set(fut_indices))
     ts_fut = pd.to_datetime(ts[fut_indices])
 
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T, N)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     locs = list(map(str, ds_train.location.values))
     df = pd.DataFrame(y[fut_indices, :], columns=locs, index=ts_fut).reset_index().rename(columns={"index": "timestamp"})
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -797,7 +743,7 @@ def _truth_wide_for_val(ds_train, aux, horizon, train_last_day=80) -> pd.DataFra
 @torch.no_grad()
 def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80) -> pd.DataFrame:
     """
-    Rolling validation predictions with **independent** per-county inference (N=1).
+    Rolling validation predictions with independent per-county inference (N=1).
     Returns long df [timestamp, location, pred].
     """
     model.eval()
@@ -824,9 +770,9 @@ def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80)
         for i, county in enumerate(locs):
             Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, Din)  # (1, T, 1, Din)
             xb = torch.tensor(Xin_i, dtype=torch.float32, device=DEVICE)
-            _, fut = model(xb)                              # (1, H, 1, F)
-            fut_np = fut[0, :, 0, :].detach().cpu().numpy() # (H, F)
-            pred_sc = fut_np[:, 0]                          # outage channel -> (H,)
+            _, fut_i = model(xb)                              # <— clean context inference
+            fut_np = fut_i[0, :, 0, :].detach().cpu().numpy() # (H, F)
+            pred_sc = fut_np[:, 0]                            # outage channel
 
             y_mu = float(scalers["y_mu"].flatten()[0])
             y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
@@ -845,28 +791,25 @@ def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80)
         return pd.DataFrame(columns=["timestamp", "location", "pred"])
 
 # =========================
-# Training loop (with calm/storm reporting & BEST_BY)
+# Training loop (decoupled recon/forecast contexts)
 # =========================
 def train_multitask_contrast(ds_train):
-    # --- Build split-aware train windows (fit scalers on days 1..80) ---
     X_tr, Y_fut_tr, Din, scalers, aux = prepare_multitask_windows_split(
         ds_train, seq_len=SEQ_LEN, horizon=H_PRE, train_last_day=TRAIN_LAST_DAY
     )
     dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
                             torch.tensor(Y_fut_tr, dtype=torch.float32))
 
-    # Storm-aware sample weights (based on outage channel future)
     if STORM_SAMPLING and len(dataset) > 0:
         with torch.no_grad():
-            y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)  # (nS, H, 1)
-            s = y_h.mean(dim=(1, 2)).clamp_min(0) + 1e-6              # (nS,)
+            y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)
+            s = y_h.mean(dim=(1, 2)).clamp_min(0) + 1e-6
             w = (s ** STORM_POW)
             w = (w / (w.mean() + 1e-6)).clamp_min(STORM_MIN_WEIGHT)
             sample_weights = w.numpy()
     else:
         sample_weights = None
 
-    # Sampler with replacement to expand steps/epoch if desired
     if EPOCH_EXPANSION and EPOCH_EXPANSION > 1.0:
         num_samples = int(len(dataset) * float(EPOCH_EXPANSION))
         if STORM_SAMPLING and sample_weights is not None and len(sample_weights) > 0:
@@ -883,7 +826,6 @@ def train_multitask_contrast(ds_train):
         else:
             loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # --- Build validation windows (day-ahead) for loss ---
     X_val, Y_val = build_val_windows_day_ahead(aux, horizon=H_PRE, seq_len=SEQ_LEN, train_last_day=TRAIN_LAST_DAY)
     have_val_loss = X_val.shape[0] > 0
     if have_val_loss:
@@ -893,10 +835,8 @@ def train_multitask_contrast(ds_train):
     else:
         val_loader = None
 
-    # --- Model ---
     model = MultiTaskCBEncoder(in_channels=Din, horizon=H_PRE).to(DEVICE)
 
-    # Ensure trainable parts include LoRA + our adapters & heads
     for p in model.encoder.embed_proj.parameters():
         p.requires_grad = True
     for p in model.encoder.post_proj.parameters():
@@ -913,9 +853,7 @@ def train_multitask_contrast(ds_train):
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
                            lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # Ground truth frames for rolling RMSE
     df_truth_val = _truth_wide_for_val(ds_train, aux, H_PRE, train_last_day=TRAIN_LAST_DAY)
-    zero_rmse_val_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
     best = {"loss": float("inf"), "overall": float("inf"), "calm": float("inf"), "storm": float("inf"), "epoch": -1}
 
@@ -930,13 +868,25 @@ def train_multitask_contrast(ds_train):
                 xb = xb.to(DEVICE)  # (B, T, 1, F)
                 yb = yb.to(DEVICE)  # (B, H, 1, F)
                 Bsz, T, _, _ = xb.shape
-                mask_ssl = make_temporal_mask(
-                    Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
-                )
+
+                # masked for recon, clean for forecast (FIX)
+                mask_ssl = make_temporal_mask(Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device)
                 xmasked = apply_mask(xb, mask_ssl)
-                recon, fut = model(xmasked)
+
+                # recon on masked
+                h_mask = model.encode_steps(xmasked)
+                recon = model.recon_head(h_mask)
+
+                # forecast on clean
+                h_ctx = model.encode_steps(xb)
+                pooled = h_ctx.mean(dim=1)
+                fut = model.forecast_head(pooled)
+                Bv, N, _ = fut.shape
+                fut = fut.view(Bv, N, H_PRE, -1).permute(0, 2, 1, 3)
+
                 l_ssl  = masked_recon_loss(recon, xb, mask_ssl)
                 l_fore = forecast_loss(fut, yb)
+
                 if USE_CONTRASTIVE:
                     x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
                                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
@@ -947,6 +897,7 @@ def train_multitask_contrast(ds_train):
                     l_contrast = info_nce_loss(z1, z2, tau=TAU)
                 else:
                     l_contrast = torch.tensor(0.0, device=xb.device)
+
                 l = W_SSL * l_ssl + W_FORECAST * l_fore + W_CONTRAST * l_contrast
                 total += l.item() * xb.size(0)
                 count += xb.size(0)
@@ -962,41 +913,39 @@ def train_multitask_contrast(ds_train):
             xb = xb.to(DEVICE)      # (B, T, 1, F)
             yb = yb.to(DEVICE)      # (B, H, 1, F)
 
-            # TSMixup
             xb, yb = tsmixup_batch(
                 xb, yb,
-                p=TSMIXUP_PROB,
-                k_max=TSMIXUP_K_MAX,
-                alpha=TSMIXUP_ALPHA,
-                segment=TSMIXUP_SEGMENT,
-                len_frac=TSMIXUP_LEN_FRAC,
-                eps=TSMIXUP_EPS
+                p=TSMIXUP_PROB, k_max=TSMIXUP_K_MAX, alpha=TSMIXUP_ALPHA,
+                segment=TSMIXUP_SEGMENT, len_frac=TSMIXUP_LEN_FRAC, eps=TSMIXUP_EPS
             )
 
             Bsz, T, _, _ = xb.shape
-            mask_ssl = make_temporal_mask(
-                Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
-            )
+            mask_ssl = make_temporal_mask(Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device)
             xmasked = apply_mask(xb, mask_ssl)
 
             opt.zero_grad()
-            recon, fut = model(xmasked)  # recon: (B,T,1,F), fut: (B,H,1,F)
 
+            # Reconstruction branch (masked)
+            h_mask = model.encode_steps(xmasked)
+            recon = model.recon_head(h_mask)
             loss_ssl  = masked_recon_loss(recon, xb, mask_ssl)
-            loss_fore = forecast_loss(fut, yb)
-
             loss_ssl_out   = channel_mse(recon, xb, mask_ssl, ch=0)
+
+            # Forecasting branch (clean)
+            h_ctx = model.encode_steps(xb)
+            pooled = h_ctx.mean(dim=1)                    # (B, N, D_OUT)
+            fut = model.forecast_head(pooled)             # (B, N, H*F)
+            B1, N1, _ = fut.shape
+            fut = fut.view(B1, N1, H_PRE, -1).permute(0, 2, 1, 3)  # (B, H, N, F)
+            loss_fore = forecast_loss(fut, yb)
             loss_fore_out  = channel_mse(fut, yb, None, ch=0)
 
+            # Contrastive
             if USE_CONTRASTIVE:
-                x1 = make_view(
-                    xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
-                )
-                x2 = make_view(
-                    xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
-                )
+                x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                               jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
+                x2 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                               jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
                 z1 = model.pooled_projection(x1)
                 z2 = model.pooled_projection(x2)
                 loss_contrast = info_nce_loss(z1, z2, tau=TAU)
@@ -1028,7 +977,7 @@ def train_multitask_contrast(ds_train):
         # ---------- Validation: loss ----------
         val_loss = compute_val_loss()
 
-        # ---------- Validation: rolling RMSE + calm/storm with all-zero baselines ----------
+        # ---------- Validation: rolling RMSE + calm/storm ----------
         if df_truth_val is not None and not df_truth_val.empty:
             df_pred_val = _predict_val_roll(ds_train, model, scalers, H_PRE, aux, TRAIN_LAST_DAY)
             if not df_pred_val.empty:
@@ -1052,7 +1001,6 @@ def train_multitask_contrast(ds_train):
             zero_overall = zero_calm = zero_storm = float("nan")
             n_calm = n_storm = 0
 
-        # Reporting
         if np.isfinite(rmse_overall):
             print(f"[Pretrain Val] Epoch {epoch:02d}: ValLoss={val_loss:.6f} | Rolling RMSE={rmse_overall:.4f} (all-zero={zero_overall:.4f})")
         else:
@@ -1078,7 +1026,6 @@ def train_multitask_contrast(ds_train):
         key = str(BEST_BY).lower()
         chosen = metric_map.get(key, rmse_overall)
 
-        # Better means lower; handle NaNs gracefully
         def _is_better(new, old):
             if not np.isfinite(new):
                 return False
@@ -1133,7 +1080,6 @@ def train_multitask_contrast(ds_train):
                 )
                 print(f"[Pretrain Val] New best ({key} RMSE={chosen:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
 
-        # Optional: save LoRA adapter/backbone
         try:
             os.makedirs(SAVE_ADAPTER_DIR, exist_ok=True)
             model.encoder.backbone.save_pretrained(SAVE_ADAPTER_DIR)
