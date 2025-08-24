@@ -1,8 +1,8 @@
 # train_simple.py
 # Trains a simple outages-only model per county (SARIMAX(1,0,1)),
 # adds day-1..80 train / day-ahead rolling validation (24h & 48h),
-# prints validation RMSEs (with all-zero baselines), then writes
-# per-county predictions for both horizons as CSVs and reports test RMSEs.
+# prints validation RMSEs (with all-zero baselines) plus calm/storm breakdowns,
+# then writes per-county predictions for both horizons as CSVs and reports test RMSEs.
 
 import os
 import numpy as np
@@ -10,13 +10,26 @@ import pandas as pd
 import xarray as xr
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from validation_utils import (
+    compute_day_indices,
+    all_zero_rmse_for_truth,
+    event_rmse_blocks,
+    maybe_save_best,
+)
 
 SPLIT_DIR = "data/"
-OUT_DIR = "results/"
+OUT_DIR = "results_sarima/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
 TRAIN_LAST_DAY = 80  # mirrors other scripts
+
+# Event-stratified evaluation settings
+EVENT_METHOD   = "mean"   # or "max"
+STORM_TOP_Q    = 0.80     # top 20% days = stormy
+CALM_BOTTOM_Q  = 0.50     # bottom 50% pool = calm
+CALM_N         = 10       # sample 10 calm days
+BEST_BY        = "overall"  # metric to select best
 
 def safe_fit_sarimax(y: np.ndarray):
     y = np.asarray(y, dtype=float).flatten()
@@ -29,25 +42,12 @@ def safe_fit_sarimax(y: np.ndarray):
     except Exception:
         return None
 
-# -------- helpers to mirror day-split validation --------
-def _compute_day_indices(ts_np: np.ndarray):
-    ts = pd.to_datetime(ts_np)
-    days_norm = ts.normalize()
-    uniq = pd.DatetimeIndex(sorted(days_norm.unique()))
-    day_map = {d: i + 1 for i, d in enumerate(uniq)}
-    days = np.array([day_map[d] for d in days_norm], dtype=int)
-    day_end_idx = []
-    for d in uniq:
-        idxs = np.where(days_norm == d)[0]
-        day_end_idx.append(int(idxs.max()))
-    return days, list(uniq), day_end_idx
-
 def truth_wide_for_val(ds_train, horizon, train_last_day=80) -> pd.DataFrame:
     """
     Build the truth wide dataframe restricted to the union of all validation future timestamps.
     """
     ts = pd.to_datetime(ds_train.timestamp.values)
-    days, _, day_end_idx = _compute_day_indices(ts)
+    days, _, day_end_idx = compute_day_indices(ts)
 
     fut_indices = []
     last_day = int(days.max())
@@ -77,7 +77,7 @@ def predict_val_roll_sarimax(ds_train, horizon, train_last_day=80) -> pd.DataFra
     Returns long df: [timestamp, location, pred]
     """
     ts = pd.to_datetime(ds_train.timestamp.values)
-    days, _, day_end_idx = _compute_day_indices(ts)
+    days, _, day_end_idx = compute_day_indices(ts)
     last_train_end = day_end_idx[train_last_day - 1]
     fut_start = last_train_end + 1
     if fut_start >= len(ts):
@@ -125,17 +125,6 @@ def predict_val_roll_sarimax(ds_train, horizon, train_last_day=80) -> pd.DataFra
 
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["timestamp", "location", "pred"])
 
-def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
-    if df_truth_wide.empty:
-        return float("nan")
-    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
-    df_zero_long = pd.DataFrame({
-        "timestamp": np.repeat(df_truth_wide["timestamp"].values, len(locs)),
-        "location": np.tile(locs, len(df_truth_wide)),
-        "pred": 0.0
-    })
-    return per_county_rmse_mean(df_truth_wide, df_zero_long)
-
 def main():
     ds_train = xr.open_dataset(os.path.join(SPLIT_DIR, "train.nc"))
     # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h.nc"))
@@ -155,21 +144,69 @@ def main():
     df_truth_val_24 = truth_wide_for_val(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
     df_pred_val_24  = predict_val_roll_sarimax(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
     if not df_truth_val_24.empty and not df_pred_val_24.empty:
-        zero_val_24 = _all_zero_rmse_for_truth(df_truth_val_24)
-        rmse_val_24 = per_county_rmse_mean(df_truth_val_24, df_pred_val_24)
-        print(f"[Val 24h] Rolling RMSE={rmse_val_24:.4f} (all-zero RMSE={zero_val_24:.4f})")
+        (rmse_overall_24, zero_val_24,
+         rmse_calm_24, zero_calm_24, n_calm_24,
+         rmse_storm_24, zero_storm_24, n_storm_24) = event_rmse_blocks(
+            ds_train, df_truth_val_24, df_pred_val_24,
+            train_last_day=TRAIN_LAST_DAY,
+            method=EVENT_METHOD,
+            storm_top_q=STORM_TOP_Q,
+            calm_bottom_q=CALM_BOTTOM_Q,
+            calm_n=CALM_N,
+            seed=42,
+        )
+
+        print(f"[Val 24h] Rolling RMSE={rmse_overall_24:.4f} (all-zero RMSE={zero_val_24:.4f})")
+        if np.isfinite(rmse_calm_24):
+            print(f"[EventEval 24h] Calm-heavy ({n_calm_24} days): RMSE={rmse_calm_24:.4f} (all-zero={zero_calm_24:.4f})")
+        else:
+            print("[EventEval 24h] Calm-heavy: RMSE=nan (all-zero=nan)")
+        if np.isfinite(rmse_storm_24):
+            print(f"[EventEval 24h] Storm-heavy ({n_storm_24} days): RMSE={rmse_storm_24:.4f} (all-zero={zero_storm_24:.4f})")
+        else:
+            print("[EventEval 24h] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+        best24 = {"rmse": float("inf"), "epoch": -1}
+        maybe_save_best(None, 0, "24h", rmse_overall_24, rmse_calm_24, rmse_storm_24,
+                        best24, OUT_DIR, "best_sarima", BEST_BY)
     else:
         print("[Val 24h] Rolling RMSE=nan (all-zero RMSE=nan)")
+        print("[EventEval 24h] Calm-heavy: RMSE=nan (all-zero=nan)")
+        print("[EventEval 24h] Storm-heavy: RMSE=nan (all-zero=nan)")
 
     # 48h validation
     df_truth_val_48 = truth_wide_for_val(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
     df_pred_val_48  = predict_val_roll_sarimax(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
     if not df_truth_val_48.empty and not df_pred_val_48.empty:
-        zero_val_48 = _all_zero_rmse_for_truth(df_truth_val_48)
-        rmse_val_48 = per_county_rmse_mean(df_truth_val_48, df_pred_val_48)
-        print(f"[Val 48h] Rolling RMSE={rmse_val_48:.4f} (all-zero RMSE={zero_val_48:.4f})")
+        (rmse_overall_48, zero_val_48,
+         rmse_calm_48, zero_calm_48, n_calm_48,
+         rmse_storm_48, zero_storm_48, n_storm_48) = event_rmse_blocks(
+            ds_train, df_truth_val_48, df_pred_val_48,
+            train_last_day=TRAIN_LAST_DAY,
+            method=EVENT_METHOD,
+            storm_top_q=STORM_TOP_Q,
+            calm_bottom_q=CALM_BOTTOM_Q,
+            calm_n=CALM_N,
+            seed=42,
+        )
+
+        print(f"[Val 48h] Rolling RMSE={rmse_overall_48:.4f} (all-zero RMSE={zero_val_48:.4f})")
+        if np.isfinite(rmse_calm_48):
+            print(f"[EventEval 48h] Calm-heavy ({n_calm_48} days): RMSE={rmse_calm_48:.4f} (all-zero={zero_calm_48:.4f})")
+        else:
+            print("[EventEval 48h] Calm-heavy: RMSE=nan (all-zero=nan)")
+        if np.isfinite(rmse_storm_48):
+            print(f"[EventEval 48h] Storm-heavy ({n_storm_48} days): RMSE={rmse_storm_48:.4f} (all-zero={zero_storm_48:.4f})")
+        else:
+            print("[EventEval 48h] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+        best48 = {"rmse": float("inf"), "epoch": -1}
+        maybe_save_best(None, 0, "48h", rmse_overall_48, rmse_calm_48, rmse_storm_48,
+                        best48, OUT_DIR, "best_sarima", BEST_BY)
     else:
         print("[Val 48h] Rolling RMSE=nan (all-zero RMSE=nan)")
+        print("[EventEval 48h] Calm-heavy: RMSE=nan (all-zero=nan)")
+        print("[EventEval 48h] Storm-heavy: RMSE=nan (all-zero=nan)")
 
     # -------- Per-county test forecasts (same outputs as before) --------
     rows24 = []
@@ -213,8 +250,8 @@ def main():
     # -------- Test RMSEs (mirror other scripts; use demo_evaluate) --------
     df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
-    zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
+    zero_rmse_24 = all_zero_rmse_for_truth(df_t24)
+    zero_rmse_48 = all_zero_rmse_for_truth(df_t48)
 
     test_rmse_24 = per_county_rmse_mean(df_t24, df24)
     test_rmse_48 = per_county_rmse_mean(df_t48, df48)
