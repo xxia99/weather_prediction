@@ -43,9 +43,9 @@ def all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
 
 
 def _per_day_outage_score(ds_train, method: str = "mean"):
-    """Return day indices, unique day boundaries, and per-day outage scores."""
+    """Return day indices and outage score per day."""
     ts = ds_train.timestamp.values
-    days, uniq, _end = compute_day_indices(ts)
+    days, _, _ = compute_day_indices(ts)
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     df = pd.DataFrame({"day": days, "y": y.mean(axis=1)})
     if method.lower() == "max":
@@ -55,7 +55,7 @@ def _per_day_outage_score(ds_train, method: str = "mean"):
     max_day = int(days.max())
     day_score = np.zeros(max_day, dtype=float)
     day_score[g.index.values - 1] = g.values
-    return days, uniq, day_score
+    return days, day_score
 
 
 def _timestamps_for_days(ts: np.ndarray, select_days: set[int]) -> pd.DatetimeIndex:
@@ -81,39 +81,23 @@ def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
                       train_last_day, method, storm_top_q,
                       calm_bottom_q, calm_n, seed):
     """Compute overall, calm-day, and storm-day RMSE blocks."""
-    df_truth_val = df_truth_val.copy()
-    df_pred_val = df_pred_val.copy()
-    if not df_truth_val.empty:
-        df_truth_val["timestamp"] = pd.to_datetime(df_truth_val["timestamp"], errors="coerce")
-    if not df_pred_val.empty:
-        df_pred_val["timestamp"] = pd.to_datetime(df_pred_val["timestamp"], errors="coerce")
-
     rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
     zero_overall = all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
 
     rng = np.random.default_rng(seed)
     ts = ds_train.timestamp.values
-    days, uniq_days, day_score = _per_day_outage_score(ds_train, method=method)
-    day_map = {d: i + 1 for i, d in enumerate(uniq_days)}
-
-    # Determine which days have both truth and predictions
-    truth_days = set()
-    if not df_truth_val.empty:
-        truth_days = {day_map[d] for d in pd.to_datetime(df_truth_val["timestamp"]).dt.normalize() if d in day_map}
-    pred_days = set()
-    if not df_pred_val.empty:
-        pred_days = {day_map[d] for d in pd.to_datetime(df_pred_val["timestamp"]).dt.normalize() if d in day_map}
-    avail_days = sorted((truth_days & pred_days) - set(range(1, train_last_day + 1)))
-    if len(avail_days) == 0:
+    days, day_score = _per_day_outage_score(ds_train, method=method)
+    last_day = int(days.max())
+    tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
+    if len(tgt_days) == 0:
         return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
 
-    avail_days = np.asarray(avail_days, dtype=int)
-    tgt_scores = day_score[avail_days - 1]
+    tgt_scores = day_score[tgt_days - 1]
     storm_thr = np.quantile(tgt_scores, storm_top_q)
     calm_thr = np.quantile(tgt_scores, calm_bottom_q)
 
-    storm_days = set(avail_days[tgt_scores >= storm_thr].tolist())
-    calm_pool = avail_days[tgt_scores <= calm_thr].tolist()
+    storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
+    calm_pool = tgt_days[tgt_scores <= calm_thr].tolist()
     if len(calm_pool) > 0:
         k = int(min(calm_n, len(calm_pool)))
         calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
@@ -125,22 +109,16 @@ def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
 
     if len(ts_calm) > 0:
         truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
-        if not truth_calm.empty and not pred_calm.empty:
-            rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
-        else:
-            rmse_calm = float("nan")
-        zero_calm = all_zero_rmse_for_truth(truth_calm) if not truth_calm.empty else float("nan")
+        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        zero_calm = all_zero_rmse_for_truth(truth_calm)
         n_calm = len(calm_days)
     else:
         rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
 
     if len(ts_storm) > 0:
         truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
-        if not truth_storm.empty and not pred_storm.empty:
-            rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
-        else:
-            rmse_storm = float("nan")
-        zero_storm = all_zero_rmse_for_truth(truth_storm) if not truth_storm.empty else float("nan")
+        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        zero_storm = all_zero_rmse_for_truth(truth_storm)
         n_storm = len(storm_days)
     else:
         rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
