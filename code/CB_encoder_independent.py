@@ -13,18 +13,20 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq/"
+OUT_DIR   = "results_seq_new/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# core training hyperparameters
 SEQ_LEN       = 24
-BATCH_SIZE    = 16
-EPOCHS        = 20
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-3
+BATCH_SIZE    = 32        # larger batch for more stable gradients
+EPOCHS        = 30        # train for more epochs
+LR            = 3e-4      # higher LR for faster convergence
+WEIGHT_DECAY  = 1e-4      # lighter L2 regularization
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 # === temporal dropout probability (drop whole timesteps during training) ===
-TEMPORAL_DROP_PROB = 0.05  # e.g., 5% of timesteps zeroed per window
+# disable aggressive temporal dropout; rely on standard dropout instead
+TEMPORAL_DROP_PROB = 0.0
 
 # === PatchTST encoder hyperparams ===
 PATCH_LEN      = 2          # patch length along time (must be <= SEQ_LEN)
@@ -32,25 +34,26 @@ PATCH_STRIDE   = None       # None -> non-overlapping (stride = PATCH_LEN)
 PATCH_D_MODEL  = 64         # token/patch embedding size
 PATCH_NHEAD    = 4
 PATCH_NLAYERS  = 2
-PATCH_DROPOUT  = 0.3
+PATCH_DROPOUT  = 0.1      # reduce transformer dropout
 PATCH_FF       = 4 * PATCH_D_MODEL  # transformer FFN width
 
 # --------- StemGNN hyperparams (lightweight, tunable) ----------
 STEM_D_MODEL  = 64     # feature hidden width
-STEM_K_ORDER  = 0      # <<< disable spatial mixing (graph diffusion orders 0..K); K=0 = identity
+STEM_K_ORDER  = 2      # enable 2-hop spatial diffusion
 STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
-STEM_DROPOUT  = 0.1  # 0.5
+STEM_DROPOUT  = 0.05   # lighter dropout
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
-ENCODER_LR              = 2e-5  # smaller LR for encoder fine-tuning
-FREEZE_ENCODER          = True  # if True, keep encoder frozen during training
+ENCODER_LR              = 1e-4  # allow modest encoder fine-tuning
+FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
 USE_CB_ENCODER          = True
-CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
-
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
+CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 LOSS_HUBER_BETA = 1.0  # Huber delta

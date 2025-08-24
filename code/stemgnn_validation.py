@@ -9,32 +9,190 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from demo_evaluate import per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq/"
+OUT_DIR   = "results_stemgnn/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# core training hyperparameters
 SEQ_LEN       = 24
-BATCH_SIZE    = 16
-EPOCHS        = 20
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-3
+BATCH_SIZE    = 32        # larger batch for more stable gradients
+EPOCHS        = 30        # train for more epochs
+LR            = 3e-4      # higher LR for faster convergence
+WEIGHT_DECAY  = 1e-4      # lighter L2 regularization
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 # === NEW: temporal dropout probability (drop whole timesteps during training) ===
-TEMPORAL_DROP_PROB = 0.05  # e.g., 5% of timesteps zeroed per window
+TEMPORAL_DROP_PROB = 0.0  # e.g., 5% of timesteps zeroed per window
 
 # --------- StemGNN hyperparams (lightweight, tunable) ----------
 STEM_D_MODEL  = 64     # feature hidden width
 STEM_K_ORDER  = 2      # graph diffusion orders (0..K)
 STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
-STEM_DROPOUT  = 0.3
+STEM_DROPOUT  = 0.05
 
 # === NEW: day split for in-train validation (train on days 1..80, validate on the rest) ===
-TRAIN_LAST_DAY = 88
+TRAIN_LAST_DAY = 80
+
+# Event evaluation settings
+EVENT_METHOD   = "mean"
+STORM_TOP_Q    = 0.80
+CALM_BOTTOM_Q  = 0.50
+CALM_N         = 10
+BEST_BY        = "overall"
+
+
+def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
+    if df_truth_wide.empty:
+        return float("nan")
+    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
+    df_zero_long = pd.DataFrame({
+        "timestamp": np.repeat(df_truth_wide["timestamp"].values, len(locs)),
+        "location": np.tile(locs, len(df_truth_wide)),
+        "pred": 0.0,
+    })
+    return per_county_rmse_mean(df_truth_wide, df_zero_long)
+
+def load_truth_wide_nc(nc_path: str) -> pd.DataFrame:
+    """Return wide df with columns: timestamp, <loc1>, <loc2>, ... using netcdf4 engine."""
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(nc_path)
+    ds = xr.open_dataset(nc_path, engine="netcdf4")
+    try:
+        y = ds["out"].transpose("timestamp", "location").values.astype(float)
+        ts = pd.to_datetime(ds["timestamp"].values)
+        locs = list(map(str, ds["location"].values))
+    finally:
+        ds.close()
+    df = pd.DataFrame(y, columns=locs, index=ts).reset_index().rename(columns={"index": "timestamp"})
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df
+
+def compute_day_indices(ts_np: np.ndarray):
+    ts = pd.to_datetime(ts_np)
+    days_norm = ts.normalize()
+    uniq = pd.DatetimeIndex(sorted(days_norm.unique()))
+    day_map = {d: i + 1 for i, d in enumerate(uniq)}
+    days = np.array([day_map[d] for d in days_norm], dtype=int)
+    day_end_idx = []
+    for d in uniq:
+        idxs = np.where(days_norm == d)[0]
+        day_end_idx.append(int(idxs.max()))
+    return days, list(uniq), day_end_idx
+
+def _per_day_outage_score(ds_train, method: str = "mean"):
+    ts = ds_train.timestamp.values
+    days, _, _ = compute_day_indices(ts)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    df = pd.DataFrame({"day": days, "y": y.mean(axis=1)})
+    if method.lower() == "max":
+        g = df.groupby("day")["y"].max()
+    else:
+        g = df.groupby("day")["y"].mean()
+    max_day = int(days.max())
+    day_score = np.zeros(max_day, dtype=float)
+    day_score[g.index.values - 1] = g.values
+    return days, day_score
+
+def _timestamps_for_days(ts: np.ndarray, select_days: set[int]) -> pd.DatetimeIndex:
+    ts_pd = pd.to_datetime(ts)
+    days, _, _ = compute_day_indices(ts_pd)
+    mask = np.array([d in select_days for d in days], dtype=bool)
+    return pd.DatetimeIndex(ts_pd[mask])
+
+def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
+                               df_pred_long: pd.DataFrame,
+                               ts_subset: pd.DatetimeIndex):
+    df_truth_sel = df_truth_wide[df_truth_wide["timestamp"].isin(ts_subset)].copy()
+    df_pred_sel  = df_pred_long[df_pred_long["timestamp"].isin(ts_subset)].copy()
+    # ---- FIX: hard-cast to datetime64[ns] to avoid object dtype after slicing ----
+    if not df_truth_sel.empty:
+        df_truth_sel["timestamp"] = pd.to_datetime(df_truth_sel["timestamp"], errors="coerce").astype("datetime64[ns]")
+    if not df_pred_sel.empty:
+        df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"], errors="coerce").astype("datetime64[ns]")
+    return df_truth_sel, df_pred_sel
+
+def _coerce_ts64(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "timestamp" in df.columns:
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("datetime64[ns]")
+    return df
+
+
+def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
+                      train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
+    rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
+    zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
+
+    rng = np.random.default_rng(seed)
+    ts = ds_train.timestamp.values
+    days, day_score = _per_day_outage_score(ds_train, method=method)
+    last_day = int(days.max())
+    tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
+    if len(tgt_days) == 0:
+        return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
+
+    tgt_scores = day_score[tgt_days - 1]
+    storm_thr = np.quantile(tgt_scores, storm_top_q)
+    calm_thr  = np.quantile(tgt_scores, calm_bottom_q)
+
+    storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
+    calm_pool  = tgt_days[tgt_scores <= calm_thr].tolist()
+    if len(calm_pool) > 0:
+        k = int(min(calm_n, len(calm_pool)))
+        calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
+    else:
+        calm_days = set()
+
+    ts_storm = _timestamps_for_days(ts, storm_days)
+    ts_calm  = _timestamps_for_days(ts, calm_days)
+
+    if len(ts_calm) > 0:
+        truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
+        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        zero_calm = _all_zero_rmse_for_truth(truth_calm)
+        n_calm = len(calm_days)
+    else:
+        rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
+
+    if len(ts_storm) > 0:
+        truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
+        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        zero_storm = _all_zero_rmse_for_truth(truth_storm)
+        n_storm = len(storm_days)
+    else:
+        rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
+
+    return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
+
+def maybe_save_best(model, epoch, label, rmse_overall, rmse_calm, rmse_storm,
+                    best, out_dir, prefix, best_by="overall"):
+    metric_map = {"overall": rmse_overall, "calm": rmse_calm, "storm": rmse_storm}
+    sel = metric_map.get(str(best_by).lower(), rmse_overall)
+    sel_val = sel if np.isfinite(sel) else rmse_overall
+
+    if np.isfinite(sel_val) and sel_val < best.get("rmse", float("inf")):
+        best["rmse"] = sel_val
+        best["epoch"] = epoch
+        os.makedirs(out_dir, exist_ok=True)
+        save_path = os.path.join(out_dir, f"{prefix}_{label}.pt")
+        state = model.state_dict() if (model is not None and hasattr(model, "state_dict")) else None
+        torch.save({
+            "epoch": epoch,
+            "label": label,
+            "rmse_select": sel_val,
+            "rmse_overall": rmse_overall,
+            "rmse_calm": rmse_calm,
+            "rmse_storm": rmse_storm,
+            "best_by": str(best_by).lower(),
+            "model_state_dict": state,
+        }, save_path)
+        print(f"[Val {label}] New best ({best_by}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -190,10 +348,7 @@ class STGNNForecaster(nn.Module):
         for blk in self.blocks:
             h = blk(h)              # (B, T, N, d_model)
 
-        # last = h[:, -1, :, :]       # (B, N, d_model)
-        # y    = self.readout(last)   # (B, N, H)
-        # return y
-        pooled = h.mean(dim=1)  # (B, N, d_model)   # simple temporal average
+        pooled = h.mean(dim=1)  # (B, N, d_model)
         y = self.readout(pooled)  # (B, N, H)
         return y
 
@@ -211,7 +366,6 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     loss_fn = nn.MSELoss()
-    # loss_fn = nn.SmoothL1Loss(beta=1.0)
 
     for epoch in range(EPOCHS):
         model.train()
@@ -220,10 +374,9 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
         for xb, yb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)  # xb: (B, T, N, F), yb: (B, N, H)
 
-            # === NEW: Temporal Dropout — randomly zero a few timesteps per window ===
+            # Temporal Dropout — randomly zero a few timesteps per window
             if TEMPORAL_DROP_PROB > 0.0:
                 with torch.no_grad():
-                    # Mask shape (B, T, 1, 1): same mask applied across all nodes & features per dropped timestep
                     drop_mask = (torch.rand(xb.size(0), xb.size(1), 1, 1, device=xb.device) < TEMPORAL_DROP_PROB).float()
                     xb = xb * (1.0 - drop_mask)
 
@@ -253,27 +406,6 @@ def infer(model, Xin):
     out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
     return out.cpu().numpy()
 
-# ---------------- NEW: split-aware helpers (train on days 1..80; val day-ahead on the rest) ----------------
-def _compute_day_indices(ts: np.ndarray):
-    """
-    Map each timestamp to a day index starting at 1.
-    Returns: days (T,), unique_days (list[pd.Timestamp]), day_end_idx (list[int])
-    """
-    ts_pd = pd.to_datetime(ts)
-    days_norm = ts_pd.normalize()
-    uniq = days_norm.unique()
-    # sort to be sure
-    uniq = pd.DatetimeIndex(sorted(uniq))
-    # map day number starting at 1
-    day_map = {d: i+1 for i, d in enumerate(uniq)}
-    days = np.array([day_map[d] for d in days_norm], dtype=int)
-    day_end_idx = []
-    for d in uniq:
-        mask = (days_norm == d)
-        idxs = np.where(mask)[0]
-        day_end_idx.append(int(idxs.max()))
-    return days, list(uniq), day_end_idx
-
 def _fit_scalers_train_only(y, w, days, train_last_day):
     mask = days <= train_last_day
     y_tr = y[mask, :].reshape(-1, 1)
@@ -294,7 +426,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
     ts = pd.to_datetime(ds_train.timestamp.values)
-    days, uniq_days, day_end_idx = _compute_day_indices(ts)
+    days, uniq_days, day_end_idx = compute_day_indices(ts)
     T, N, F = w.shape
     Din = 1 + F
 
@@ -306,9 +438,11 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
 
     N_total = T - SEQ_LEN - horizon + 1
     if N_total <= 0:
-        raise RuntimeError("Not enough history for the given SEQ_LEN and horizon.")
+        aux = {"y_sc": y_sc, "timestamps": ts, "days": days, "day_end_idx": day_end_idx}
+        return np.empty((0, SEQ_LEN, N, Din)), np.empty((0, N, horizon)), Din, scalers, aux
 
-    day_last_idx = day_end_idx[train_last_day - 1]
+    last_train_day = min(train_last_day, int(days.max()))
+    day_last_idx = day_end_idx[last_train_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
     X_list, Y_list = [], []
@@ -413,18 +547,6 @@ def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
-# -------- NEW: helper for all-zero baseline on a given truth frame --------
-def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
-    if df_truth_wide.empty:
-        return float("nan")
-    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
-    df_zero_long = pd.DataFrame({
-        "timestamp": np.repeat(df_truth_wide["timestamp"].values, len(locs)),
-        "location": np.tile(locs, len(df_truth_wide)),
-        "pred": 0.0
-    })
-    return per_county_rmse_mean(df_truth_wide, df_zero_long)
-
 # -------- NEW: unified callback (rolling val + test; save best by val RMSE) --------
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                               train_last_day=80,
@@ -432,43 +554,47 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     """
     Evaluate each epoch on rolling day-ahead validation (days 81..end) **and** on the test set.
     Prints:
-      - Rolling RMSE=xxx.xxxx (all-zero RMSE=yyy.yyyy)
-      - Testing RMSE=aaa.aaaa (all-zero RMSE=bbb.bbbb)
-    Saves best checkpoint (by validation RMSE).
+      - Rolling RMSE + all-zero baseline
+      - Calm-heavy & Storm-heavy RMSEs + baselines
+      - Testing RMSE + all-zero baseline
+    Saves best checkpoint according to `BEST_BY` metric.
     """
     best = {"rmse": float("inf"), "epoch": -1}
-    df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
-
-    # Pre-build an all-zero baseline for validation timestamps/locations
-    if not df_truth_val.empty:
-        zero_rmse_val = _all_zero_rmse_for_truth(df_truth_val)
-    else:
-        zero_rmse_val = float("nan")
+    df_truth_val = _coerce_ts64(truth_wide_for_val(ds_train, aux, horizon, train_last_day))
 
     def _callback(model, epoch):
         # ---- Validation (rolling) ----
-        df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
-        if df_pred_val.empty or df_truth_val.empty:
+        df_pred_val = _coerce_ts64(predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day))
+        df_truth_val_local = _coerce_ts64(df_truth_val)
+        if df_pred_val.empty or df_truth_val_local.empty:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero RMSE=nan)")
+            print(f"[EventEval {label}] Calm-heavy: RMSE=nan (all-zero=nan)")
+            print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
         else:
-            rmse = per_county_rmse_mean(df_truth_val, df_pred_val)
-            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse:.4f} (all-zero RMSE={zero_rmse_val:.4f})")
+            (rmse_overall, zero_overall,
+             rmse_calm, zero_calm, n_calm,
+             rmse_storm, zero_storm, n_storm) = event_rmse_blocks(
+                ds_train, df_truth_val_local, df_pred_val,
+                train_last_day=train_last_day,
+                method=EVENT_METHOD,
+                storm_top_q=STORM_TOP_Q,
+                calm_bottom_q=CALM_BOTTOM_Q,
+                calm_n=CALM_N,
+                seed=42,
+            )
 
-            # Save best by validation RMSE
-            if np.isfinite(rmse) and rmse < best["rmse"]:
-                best["rmse"] = rmse
-                best["epoch"] = epoch
-                save_path = os.path.join(OUT_DIR, f"best_stgnn_{label}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "label": label,
-                        "rmse": rmse,
-                        "model_state_dict": model.state_dict(),
-                    },
-                    save_path,
-                )
-                print(f"[Val {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+            print(f"[Val {label}] Epoch {epoch}: Rolling RMSE={rmse_overall:.4f} (all-zero RMSE={zero_overall:.4f})")
+            if np.isfinite(rmse_calm):
+                print(f"[EventEval {label}] Calm-heavy ({n_calm} days): RMSE={rmse_calm:.4f} (all-zero={zero_calm:.4f})")
+            else:
+                print(f"[EventEval {label}] Calm-heavy: RMSE=nan (all-zero=nan)")
+            if np.isfinite(rmse_storm):
+                print(f"[EventEval {label}] Storm-heavy ({n_storm} days): RMSE={rmse_storm:.4f} (all-zero={zero_storm:.4f})")
+            else:
+                print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+            maybe_save_best(model, epoch, label, rmse_overall, rmse_calm, rmse_storm,
+                            best, OUT_DIR, "best_stgnn", BEST_BY)
 
         # ---- Test set evaluation at each validation step ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
@@ -506,12 +632,12 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     Xin = X_all[-SEQ_LEN:]                                    # (SEQ_LEN, N, Din)
     Xin = Xin.reshape(1, SEQ_LEN, N, Din)                     # (1, SEQ_LEN, N, Din)
 
-    # Predict (scaled)
-    pred_sc = infer(model, Xin)[0]                            # (N, H)
-
-    # Invert scaling
-    pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
-    pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+    if model is None:
+        pred = np.zeros((N, horizon), dtype=float)
+    else:
+        pred_sc = infer(model, Xin)[0]                        # (N, H)
+        pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
+        pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
 
     # Assemble DataFrame
     rows = []
@@ -521,13 +647,20 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
 
 # ---------------- main ----------------
 def main():
-    # Load train + test
-    ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
-    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # ds_train = open_ds(os.path.join(SPLIT_DIR, "train_50days.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    # Load train + test with fallbacks for demo data
+    train_path = os.path.join(SPLIT_DIR, "train.nc")
+    if not os.path.exists(train_path):
+        train_path = os.path.join(SPLIT_DIR, "train_10days.nc")
+    ds_train = open_ds(train_path)
+
+    t24_path = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
+    if not os.path.exists(t24_path):
+        t24_path = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    t48_path = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    if not os.path.exists(t48_path):
+        t48_path = os.path.join(SPLIT_DIR, "valid_2days.nc")
+    ds_test24 = xr.open_dataset(t24_path, engine="netcdf4")
+    ds_test48 = xr.open_dataset(t48_path, engine="netcdf4")
 
     # Ensure features exist (and implicitly use all of them)
     _ = get_all_features(ds_train)
@@ -538,10 +671,14 @@ def main():
     H24, H48 = len(ts24), len(ts48)
 
     # Truth data for evaluation (test)
-    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    t24_truth_path = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
+    if not os.path.exists(t24_truth_path):
+        t24_truth_path = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    t48_truth_path = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    if not os.path.exists(t48_truth_path):
+        t48_truth_path = os.path.join(SPLIT_DIR, "valid_2days.nc")
+    df_t24 = load_truth_wide_nc(t24_truth_path)
+    df_t48 = load_truth_wide_nc(t48_truth_path)
 
     # Pre-compute all-zero RMSE for test sets (NEW)
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
@@ -572,10 +709,11 @@ def main():
             ckpt24 = torch.load(best24_path, map_location=DEVICE)
             try:
                 mdl24.load_state_dict(ckpt24["model_state_dict"])
-                rmse24_val = ckpt24.get("rmse", None)
+                rmse24_val = ckpt24.get("rmse_select", ckpt24.get("rmse", None))
                 ep24 = ckpt24.get("epoch", None)
+                by24 = ckpt24.get("best_by", "overall")
                 if isinstance(rmse24_val, (float, int)):
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val RMSE={rmse24_val:.4f})")
+                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val selected RMSE={rmse24_val:.4f}, best_by={by24})")
                 else:
                     print(f"[24h] Loaded best checkpoint (epoch {ep24})")
             except Exception as e:
@@ -594,10 +732,11 @@ def main():
             ckpt48 = torch.load(best48_path, map_location=DEVICE)
             try:
                 mdl48.load_state_dict(ckpt48["model_state_dict"])
-                rmse48_val = ckpt48.get("rmse", None)
+                rmse48_val = ckpt48.get("rmse_select", ckpt48.get("rmse", None))
                 ep48 = ckpt48.get("epoch", None)
+                by48 = ckpt48.get("best_by", "overall")
                 if isinstance(rmse48_val, (float, int)):
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val RMSE={rmse48_val:.4f})")
+                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val selected RMSE={rmse48_val:.4f}, best_by={by48})")
                 else:
                     print(f"[48h] Loaded best checkpoint (epoch {ep48})")
             except Exception as e:
@@ -622,7 +761,7 @@ def main():
                              "pred": 0.0})
 
     # Save
-    out24 = os.path.join(OUT_DIR, "stemgnn_pred_24h.csv")  # kept filename to avoid changing other code
+    out24 = os.path.join(OUT_DIR, "stemgnn_pred_24h.csv")
     out48 = os.path.join(OUT_DIR, "stemgnn_pred_48h.csv")
     df24.to_csv(out24, index=False)
     df48.to_csv(out48, index=False)

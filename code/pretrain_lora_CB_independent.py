@@ -8,7 +8,7 @@ import xarray as xr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, RandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 
 # =========================
 # Config
@@ -22,7 +22,7 @@ DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 # Windows / data
 SEQ_LEN     = 24     # context length T (match downstream)
 H_PRE       = 24     # pretraining forecast horizon H
-BATCH_SIZE  = 512   # batch size for training
+BATCH_SIZE  = 256   # batch size for training
 
 # Training
 EPOCHS          = 100
@@ -32,7 +32,7 @@ GRAD_CLIP_NORM  = 5.0
 
 # ---------- Masking for SSL ----------
 MASK_MODE               = "span"   # "random" or "span"
-MASK_RATIO              = 0.30     # fraction of timesteps masked per window
+MASK_RATIO              = 0.15     # fraction of timesteps masked per window (lighter masking for better context)
 SPAN_LEN                = 4        # used if MASK_MODE=="span": contiguous length per span
 
 # For contrastive views (lighter masking by default)
@@ -42,7 +42,7 @@ VIEW_SPAN_LEN           = 3
 
 # ---------- Contrastive (InfoNCE) ----------
 USE_CONTRASTIVE         = True
-W_CONTRAST              = 1.0
+W_CONTRAST              = 0.5
 TAU                     = 0.2
 ADD_JITTER_STD          = 0.01
 ADD_DROPOUT_PROB        = 0.0
@@ -63,8 +63,6 @@ FREQ_SHELF_STRENGTH     = (0.3, 0.8)
 # ---------- Multitask loss weights ----------
 W_SSL       = 1.0
 W_FORECAST  = 1.0
-W_OUTAGE_SSL      = 0.5
-W_OUTAGE_FORECAST = 1.0
 
 # ---------- CB + PEFT (LoRA) ----------
 CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"
@@ -83,21 +81,6 @@ CALM_BOTTOM_Q  = 0.50
 CALM_N         = 10
 BEST_BY        = "overall"  # "overall" | "calm" | "storm" | "loss"
 
-# ---------- TSMixup ----------
-TSMIXUP_PROB       = 0.5
-TSMIXUP_K_MAX      = 3
-TSMIXUP_ALPHA      = 1.5
-TSMIXUP_SEGMENT    = False
-TSMIXUP_LEN_FRAC   = (0.5, 1.0)
-TSMIXUP_EPS        = 1e-6
-
-# ---------- Storm-weighted sampling ----------
-STORM_SAMPLING         = True
-STORM_POW              = 0.75
-STORM_MIN_WEIGHT       = 0.1
-
-# ---------- Steps-per-epoch expansion ----------
-EPOCH_EXPANSION = 2.0
 
 # Save paths
 SAVE_PATH = os.path.join(OUT_DIR, f"pretrained_cb_encoder_peft_independent_H{H_PRE}.pt")
@@ -119,15 +102,6 @@ def zfit(arr):
 
 def zapply(arr, mu, sd):
     return (arr - mu) / sd
-
-def channel_mse(pred, target, mask=None, ch=0):
-    pred_ch = pred[..., ch:ch+1]
-    targ_ch = target[..., ch:ch+1]
-    if mask is None:
-        return ((pred_ch - targ_ch) ** 2).mean()
-    m = mask.expand_as(pred_ch)
-    denom = m.sum().clamp_min(1.0)
-    return ((pred_ch - targ_ch) ** 2 * m).sum() / denom
 
 # =========================
 # Data prep (independent locations)
@@ -526,82 +500,6 @@ def make_view(x, mask_mode, mask_ratio, span_len, jitter_std, feat_drop):
     xv = freq_augment(xv, prob=FREQ_AUG_PROB)
     return xv
 
-# ---------- TSMixup helpers ----------
-def _dirichlet_weights(batch_size, k, alpha, device):
-    if k == 1:
-        w = torch.ones(batch_size, 1, device=device)
-    else:
-        w = torch.distributions.Dirichlet(alpha * torch.ones(k, device=device)).sample((batch_size,))
-    return w
-
-def _gather_k_partners(x, k, device):
-    B = x.size(0)
-    base = torch.arange(B, device=device)
-    idx = base.view(B, 1).repeat(1, k)
-    if k > 1:
-        partners = torch.randint(0, B, (B, k-1), device=device)
-        idx[:, 1:] = partners
-    x_g = x[idx.reshape(-1)].view(B, k, *x.shape[1:])
-    return x_g, idx
-
-def _mean_abs_scale(x, dims, eps):
-    s = x.abs().mean(dim=dims, keepdim=True).clamp_min(eps)
-    return x / s, s
-
-def tsmixup_batch(
-    xb, yb=None, p=0.5, k_max=3, alpha=1.5,
-    segment=False, len_frac=(0.5, 1.0), eps=1e-6
-):
-    if (p <= 0.0) or (xb.size(0) < 2) or (torch.rand(1, device=xb.device).item() > p):
-        return xb, yb
-
-    B, T, N, F = xb.shape
-    H = yb.size(1) if yb is not None else None
-
-    k = int(torch.randint(1, k_max + 1, (1,), device=xb.device).item())
-    if k == 1:
-        return xb, yb
-
-    xb_g, idx = _gather_k_partners(xb, k, xb.device)
-    if yb is not None:
-        yb_g = yb[idx.reshape(-1)].view(B, k, *yb.shape[1:])
-    else:
-        yb_g = None
-
-    w = _dirichlet_weights(B, k, alpha, xb.device).view(B, k, 1, 1, 1)
-
-    if not segment:
-        xb_scaled, _ = _mean_abs_scale(xb_g, dims=(2, 3, 4), eps=eps)
-        xb_mix = (w * xb_scaled).sum(dim=1)
-        if yb_g is not None:
-            yb_scaled, _ = _mean_abs_scale(yb_g, dims=(2, 3, 4), eps=eps)
-            yb_mix = (w * yb_scaled).sum(dim=1)
-        else:
-            yb_mix = None
-        return xb_mix, yb_mix
-
-    f = float(torch.empty((), device=xb.device).uniform_(len_frac[0], len_frac[1]).item())
-    Lx = max(1, int(round(f * T)))
-    sx = 0 if T == Lx else int(torch.randint(0, T - Lx + 1, (1,), device=xb.device).item())
-    if H is not None:
-        Ly = max(1, int(round(f * H)))
-        sy = 0 if H == Ly else int(torch.randint(0, H - Ly + 1, (1,), device=xb.device).item())
-
-    xb_out = xb.clone()
-    xb_seg = xb_g[:, :, sx:sx+Lx, :, :]
-    xb_seg_scaled, _ = _mean_abs_scale(xb_seg, dims=(2, 3, 4), eps=eps)
-    xb_out[:, sx:sx+Lx, :, :] = (w * xb_seg_scaled).sum(dim=1)
-
-    if yb_g is not None:
-        yb_out = yb.clone()
-        yb_seg = yb_g[:, :, sy:sy+Ly, :, :]
-        yb_seg_scaled, _ = _mean_abs_scale(yb_seg, dims=(2, 3, 4), eps=eps)
-        yb_out[:, sy:sy+Ly, :, :] = (w * yb_seg_scaled).sum(dim=1)
-    else:
-        yb_out = None
-
-    return xb_out, yb_out
-
 # =========================
 # Small eval helpers for rolling validation
 # =========================
@@ -791,40 +689,17 @@ def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80)
         return pd.DataFrame(columns=["timestamp", "location", "pred"])
 
 # =========================
-# Training loop (decoupled recon/forecast contexts)
+# Training loop
 # =========================
 def train_multitask_contrast(ds_train):
     X_tr, Y_fut_tr, Din, scalers, aux = prepare_multitask_windows_split(
         ds_train, seq_len=SEQ_LEN, horizon=H_PRE, train_last_day=TRAIN_LAST_DAY
     )
-    dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
-                            torch.tensor(Y_fut_tr, dtype=torch.float32))
-
-    if STORM_SAMPLING and len(dataset) > 0:
-        with torch.no_grad():
-            y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)
-            s = y_h.mean(dim=(1, 2)).clamp_min(0) + 1e-6
-            w = (s ** STORM_POW)
-            w = (w / (w.mean() + 1e-6)).clamp_min(STORM_MIN_WEIGHT)
-            sample_weights = w.numpy()
-    else:
-        sample_weights = None
-
-    if EPOCH_EXPANSION and EPOCH_EXPANSION > 1.0:
-        num_samples = int(len(dataset) * float(EPOCH_EXPANSION))
-        if STORM_SAMPLING and sample_weights is not None and len(sample_weights) > 0:
-            from torch.utils.data import WeightedRandomSampler
-            sampler = WeightedRandomSampler(sample_weights, num_samples=num_samples, replacement=True)
-        else:
-            sampler = RandomSampler(dataset, replacement=True, num_samples=num_samples)
-        loader = DataLoader(dataset, batch_size=BATCH_SIZE, sampler=sampler)
-    else:
-        if STORM_SAMPLING and sample_weights is not None and len(sample_weights) > 0:
-            from torch.utils.data import WeightedRandomSampler
-            sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
-            loader = DataLoader(dataset, batch_size=BATCH_SIZE, sampler=sampler)
-        else:
-            loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    dataset = TensorDataset(
+        torch.tensor(X_tr, dtype=torch.float32),
+        torch.tensor(Y_fut_tr, dtype=torch.float32)
+    )
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     X_val, Y_val = build_val_windows_day_ahead(aux, horizon=H_PRE, seq_len=SEQ_LEN, train_last_day=TRAIN_LAST_DAY)
     have_val_loss = X_val.shape[0] > 0
@@ -869,29 +744,23 @@ def train_multitask_contrast(ds_train):
                 yb = yb.to(DEVICE)  # (B, H, 1, F)
                 Bsz, T, _, _ = xb.shape
 
-                # masked for recon, clean for forecast (FIX)
-                mask_ssl = make_temporal_mask(Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device)
+                mask_ssl = make_temporal_mask(
+                    Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
+                )
                 xmasked = apply_mask(xb, mask_ssl)
-
-                # recon on masked
-                h_mask = model.encode_steps(xmasked)
-                recon = model.recon_head(h_mask)
-
-                # forecast on clean
-                h_ctx = model.encode_steps(xb)
-                pooled = h_ctx.mean(dim=1)
-                fut = model.forecast_head(pooled)
-                Bv, N, _ = fut.shape
-                fut = fut.view(Bv, N, H_PRE, -1).permute(0, 2, 1, 3)
-
+                recon, fut = model(xmasked)
                 l_ssl  = masked_recon_loss(recon, xb, mask_ssl)
                 l_fore = forecast_loss(fut, yb)
 
                 if USE_CONTRASTIVE:
-                    x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                                   jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
-                    x2 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                                   jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
+                    x1 = make_view(
+                        xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                        jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
+                    )
+                    x2 = make_view(
+                        xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                        jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
+                    )
                     z1 = model.pooled_projection(x1)
                     z2 = model.pooled_projection(x2)
                     l_contrast = info_nce_loss(z1, z2, tau=TAU)
@@ -913,52 +782,33 @@ def train_multitask_contrast(ds_train):
             xb = xb.to(DEVICE)      # (B, T, 1, F)
             yb = yb.to(DEVICE)      # (B, H, 1, F)
 
-            xb, yb = tsmixup_batch(
-                xb, yb,
-                p=TSMIXUP_PROB, k_max=TSMIXUP_K_MAX, alpha=TSMIXUP_ALPHA,
-                segment=TSMIXUP_SEGMENT, len_frac=TSMIXUP_LEN_FRAC, eps=TSMIXUP_EPS
-            )
-
             Bsz, T, _, _ = xb.shape
-            mask_ssl = make_temporal_mask(Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device)
+            mask_ssl = make_temporal_mask(
+                Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
+            )
             xmasked = apply_mask(xb, mask_ssl)
 
             opt.zero_grad()
-
-            # Reconstruction branch (masked)
-            h_mask = model.encode_steps(xmasked)
-            recon = model.recon_head(h_mask)
+            recon, fut = model(xmasked)
             loss_ssl  = masked_recon_loss(recon, xb, mask_ssl)
-            loss_ssl_out   = channel_mse(recon, xb, mask_ssl, ch=0)
-
-            # Forecasting branch (clean)
-            h_ctx = model.encode_steps(xb)
-            pooled = h_ctx.mean(dim=1)                    # (B, N, D_OUT)
-            fut = model.forecast_head(pooled)             # (B, N, H*F)
-            B1, N1, _ = fut.shape
-            fut = fut.view(B1, N1, H_PRE, -1).permute(0, 2, 1, 3)  # (B, H, N, F)
             loss_fore = forecast_loss(fut, yb)
-            loss_fore_out  = channel_mse(fut, yb, None, ch=0)
 
-            # Contrastive
             if USE_CONTRASTIVE:
-                x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                               jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
-                x2 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
-                               jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB)
+                x1 = make_view(
+                    xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
+                )
+                x2 = make_view(
+                    xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
+                    jitter_std=ADD_JITTER_STD, feat_drop=ADD_DROPOUT_PROB
+                )
                 z1 = model.pooled_projection(x1)
                 z2 = model.pooled_projection(x2)
                 loss_contrast = info_nce_loss(z1, z2, tau=TAU)
             else:
                 loss_contrast = torch.tensor(0.0, device=xb.device)
 
-            loss = (
-                W_SSL * loss_ssl
-                + W_FORECAST * loss_fore
-                + W_CONTRAST * loss_contrast
-                + W_OUTAGE_SSL * loss_ssl_out
-                + W_OUTAGE_FORECAST * loss_fore_out
-            )
+            loss = W_SSL * loss_ssl + W_FORECAST * loss_fore + W_CONTRAST * loss_contrast
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
