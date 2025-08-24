@@ -18,10 +18,10 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training hyperparameters
 SEQ_LEN       = 24
-BATCH_SIZE    = 32        # larger batch for more stable gradients
-EPOCHS        = 30        # train for more epochs
-LR            = 3e-4      # higher LR for faster convergence
-WEIGHT_DECAY  = 1e-4      # lighter L2 regularization
+BATCH_SIZE    = 64        # larger batch for more stable gradients
+EPOCHS        = 40        # train for more epochs
+LR            = 5e-4      # higher LR for faster convergence
+WEIGHT_DECAY  = 5e-5      # lighter L2 regularization
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 # === temporal dropout probability (drop whole timesteps during training) ===
@@ -34,7 +34,7 @@ PATCH_STRIDE   = None       # None -> non-overlapping (stride = PATCH_LEN)
 PATCH_D_MODEL  = 64         # token/patch embedding size
 PATCH_NHEAD    = 4
 PATCH_NLAYERS  = 2
-PATCH_DROPOUT  = 0.1      # reduce transformer dropout
+PATCH_DROPOUT  = 0.05     # reduce transformer dropout
 PATCH_FF       = 4 * PATCH_D_MODEL  # transformer FFN width
 
 # --------- StemGNN hyperparams (lightweight, tunable) ----------
@@ -42,11 +42,11 @@ STEM_D_MODEL  = 64     # feature hidden width
 STEM_K_ORDER  = 2      # enable 2-hop spatial diffusion
 STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
-STEM_DROPOUT  = 0.05   # lighter dropout
+STEM_DROPOUT  = 0.03   # lighter dropout
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
-ENCODER_LR              = 1e-4  # allow modest encoder fine-tuning
+ENCODER_LR              = 3e-4  # allow modest encoder fine-tuning
 FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
@@ -55,7 +55,6 @@ CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
-LOSS_HUBER_BETA = 1.0  # Huber delta
 
 # === Event-stratified validation settings (NEW) ===
 EVENT_METHOD   = "mean"   # or "max"
@@ -795,7 +794,7 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             weight_decay=WEIGHT_DECAY
         )
 
-    loss_fn = nn.SmoothL1Loss(beta=LOSS_HUBER_BETA)
+    loss_fn = nn.MSELoss()
 
     for epoch in range(EPOCHS):
         model.train()
