@@ -9,7 +9,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from demo_evaluate import per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -54,6 +54,21 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
         "pred": 0.0,
     })
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
+
+def load_truth_wide_nc(nc_path: str) -> pd.DataFrame:
+    """Return wide df with columns: timestamp, <loc1>, <loc2>, ... using netcdf4 engine."""
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(nc_path)
+    ds = xr.open_dataset(nc_path, engine="netcdf4")
+    try:
+        y = ds["out"].transpose("timestamp", "location").values.astype(float)
+        ts = pd.to_datetime(ds["timestamp"].values)
+        locs = list(map(str, ds["location"].values))
+    finally:
+        ds.close()
+    df = pd.DataFrame(y, columns=locs, index=ts).reset_index().rename(columns={"index": "timestamp"})
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df
 
 def compute_day_indices(ts_np: np.ndarray):
     ts = pd.to_datetime(ts_np)
@@ -426,9 +441,11 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
 
     N_total = T - SEQ_LEN - horizon + 1
     if N_total <= 0:
-        raise RuntimeError("Not enough history for the given SEQ_LEN and horizon.")
+        aux = {"y_sc": y_sc, "timestamps": ts, "days": days, "day_end_idx": day_end_idx}
+        return np.empty((0, SEQ_LEN, N, Din)), np.empty((0, N, horizon)), Din, scalers, aux
 
-    day_last_idx = day_end_idx[train_last_day - 1]
+    last_train_day = min(train_last_day, int(days.max()))
+    day_last_idx = day_end_idx[last_train_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
     X_list, Y_list = [], []
@@ -618,12 +635,12 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     Xin = X_all[-SEQ_LEN:]                                    # (SEQ_LEN, N, Din)
     Xin = Xin.reshape(1, SEQ_LEN, N, Din)                     # (1, SEQ_LEN, N, Din)
 
-    # Predict (scaled)
-    pred_sc = infer(model, Xin)[0]                            # (N, H)
-
-    # Invert scaling
-    pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
-    pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+    if model is None:
+        pred = np.zeros((N, horizon), dtype=float)
+    else:
+        pred_sc = infer(model, Xin)[0]                        # (N, H)
+        pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
+        pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
 
     # Assemble DataFrame
     rows = []
@@ -633,13 +650,20 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
 
 # ---------------- main ----------------
 def main():
-    # Load train + test
-    ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
-    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # ds_train = open_ds(os.path.join(SPLIT_DIR, "train_50days.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    # Load train + test with fallbacks for demo data
+    train_path = os.path.join(SPLIT_DIR, "train.nc")
+    if not os.path.exists(train_path):
+        train_path = os.path.join(SPLIT_DIR, "train_10days.nc")
+    ds_train = open_ds(train_path)
+
+    t24_path = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
+    if not os.path.exists(t24_path):
+        t24_path = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    t48_path = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    if not os.path.exists(t48_path):
+        t48_path = os.path.join(SPLIT_DIR, "valid_2days.nc")
+    ds_test24 = xr.open_dataset(t24_path, engine="netcdf4")
+    ds_test48 = xr.open_dataset(t48_path, engine="netcdf4")
 
     # Ensure features exist (and implicitly use all of them)
     _ = get_all_features(ds_train)
@@ -650,10 +674,14 @@ def main():
     H24, H48 = len(ts24), len(ts48)
 
     # Truth data for evaluation (test)
-    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    t24_truth_path = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
+    if not os.path.exists(t24_truth_path):
+        t24_truth_path = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    t48_truth_path = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    if not os.path.exists(t48_truth_path):
+        t48_truth_path = os.path.join(SPLIT_DIR, "valid_2days.nc")
+    df_t24 = load_truth_wide_nc(t24_truth_path)
+    df_t48 = load_truth_wide_nc(t48_truth_path)
 
     # Pre-compute all-zero RMSE for test sets (NEW)
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)

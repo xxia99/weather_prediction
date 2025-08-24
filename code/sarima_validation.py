@@ -10,7 +10,7 @@ import pandas as pd
 import xarray as xr
 import torch
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from demo_evaluate import per_county_rmse_mean
 
 SPLIT_DIR = "data/"
 OUT_DIR = "results_sarima/"
@@ -38,6 +38,21 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
         "pred": 0.0,
     })
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
+
+def load_truth_wide_nc(nc_path: str) -> pd.DataFrame:
+    """Return wide df with columns: timestamp, <loc1>, <loc2>, ... using netcdf4 engine."""
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(nc_path)
+    ds = xr.open_dataset(nc_path, engine="netcdf4")
+    try:
+        y = ds["out"].transpose("timestamp", "location").values.astype(float)
+        ts = pd.to_datetime(ds["timestamp"].values)
+        locs = list(map(str, ds["location"].values))
+    finally:
+        ds.close()
+    df = pd.DataFrame(y, columns=locs, index=ts).reset_index().rename(columns={"index": "timestamp"})
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df
 
 def compute_day_indices(ts_np: np.ndarray):
     ts = pd.to_datetime(ts_np)
@@ -209,7 +224,8 @@ def predict_val_roll_sarimax(ds_train, horizon, train_last_day=80) -> pd.DataFra
     """
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, _, day_end_idx = compute_day_indices(ts)
-    last_train_end = day_end_idx[train_last_day - 1]
+    last_train_day = min(train_last_day, int(days.max()))
+    last_train_end = day_end_idx[last_train_day - 1]
     fut_start = last_train_end + 1
     if fut_start >= len(ts):
         return pd.DataFrame(columns=["timestamp", "location", "pred"])
@@ -217,7 +233,7 @@ def predict_val_roll_sarimax(ds_train, horizon, train_last_day=80) -> pd.DataFra
     # Build set of validation timestamps (union of day-ahead windows)
     fut_indices = []
     last_day = int(days.max())
-    for d in range(train_last_day, last_day):
+    for d in range(last_train_day, last_day):
         end_idx = day_end_idx[d - 1]
         fs = end_idx + 1
         fe = fs + horizon - 1
@@ -257,13 +273,19 @@ def predict_val_roll_sarimax(ds_train, horizon, train_last_day=80) -> pd.DataFra
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["timestamp", "location", "pred"])
 
 def main():
-    ds_train = xr.open_dataset(os.path.join(SPLIT_DIR, "train.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h.nc"))
-    ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
-    # ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_1day.nc"))
-    # ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "valid_2days.nc"))
+    train_path = os.path.join(SPLIT_DIR, "train.nc")
+    if not os.path.exists(train_path):
+        train_path = os.path.join(SPLIT_DIR, "train_10days.nc")
+    ds_train = xr.open_dataset(train_path, engine="netcdf4")
+
+    t24_path = os.path.join(SPLIT_DIR, "test_24h_demo.nc")
+    if not os.path.exists(t24_path):
+        t24_path = os.path.join(SPLIT_DIR, "valid_1day.nc")
+    t48_path = os.path.join(SPLIT_DIR, "test_48h_demo.nc")
+    if not os.path.exists(t48_path):
+        t48_path = os.path.join(SPLIT_DIR, "valid_2days.nc")
+    ds_test24 = xr.open_dataset(t24_path, engine="netcdf4")
+    ds_test48 = xr.open_dataset(t48_path, engine="netcdf4")
 
     counties = list(ds_train.location.values)
     ts24 = pd.to_datetime(ds_test24.timestamp.values)
@@ -378,9 +400,9 @@ def main():
     print(f"  {out24}")
     print(f"  {out48}")
 
-    # -------- Test RMSEs (mirror other scripts; use demo_evaluate) --------
-    df_t24 = load_truth_wide(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
-    df_t48 = load_truth_wide(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
+    # -------- Test RMSEs (mirror other scripts; use local loader) --------
+    df_t24 = load_truth_wide_nc(t24_path)
+    df_t48 = load_truth_wide_nc(t48_path)
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 

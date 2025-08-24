@@ -90,20 +90,10 @@ def long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
 def per_county_rmse_mean(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame) -> float:
     locs = [c for c in df_truth_wide.columns if c != "timestamp"]
 
-    # Copy and coerce timestamps to datetime for reliable merging
-    truth = df_truth_wide.copy()
-    pred_long = df_pred_long.copy()
-    if "timestamp" in truth.columns:
-        truth["timestamp"] = pd.to_datetime(truth["timestamp"])
-    if "timestamp" in pred_long.columns:
-        pred_long["timestamp"] = pd.to_datetime(pred_long["timestamp"])
-
-    df_pred_wide = long_to_wide(pred_long, locs)
-    if "timestamp" in df_pred_wide.columns:
-        df_pred_wide["timestamp"] = pd.to_datetime(df_pred_wide["timestamp"])
+    df_pred_wide = long_to_wide(df_pred_long, locs)
 
     # Evaluate on the intersection of timestamps that appear in both truth and preds
-    df = truth.merge(df_pred_wide, on="timestamp", how="inner", suffixes=("_true", "_pred"))
+    df = df_truth_wide.merge(df_pred_wide, on="timestamp", how="inner", suffixes=("_true", "_pred"))
     if df.empty:
         # No overlapping timestamps
         return float("nan")
