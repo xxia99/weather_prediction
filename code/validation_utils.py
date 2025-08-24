@@ -115,16 +115,22 @@ def event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
 
     if len(ts_calm) > 0:
         truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
-        rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
-        zero_calm = all_zero_rmse_for_truth(truth_calm)
+        if not truth_calm.empty and not pred_calm.empty:
+            rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
+        else:
+            rmse_calm = float("nan")
+        zero_calm = all_zero_rmse_for_truth(truth_calm) if not truth_calm.empty else float("nan")
         n_calm = len(calm_days)
     else:
         rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
 
     if len(ts_storm) > 0:
         truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
-        rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
-        zero_storm = all_zero_rmse_for_truth(truth_storm)
+        if not truth_storm.empty and not pred_storm.empty:
+            rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
+        else:
+            rmse_storm = float("nan")
+        zero_storm = all_zero_rmse_for_truth(truth_storm) if not truth_storm.empty else float("nan")
         n_storm = len(storm_days)
     else:
         rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
