@@ -107,10 +107,8 @@ def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
                                ts_subset: pd.DatetimeIndex):
     df_truth_sel = df_truth_wide[df_truth_wide["timestamp"].isin(ts_subset)].copy()
     df_pred_sel  = df_pred_long[df_pred_long["timestamp"].isin(ts_subset)].copy()
-    if not df_truth_sel.empty:
-        df_truth_sel["timestamp"] = pd.to_datetime(df_truth_sel["timestamp"])
-    if not df_pred_sel.empty:
-        df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"])
+    df_truth_sel["timestamp"] = pd.to_datetime(df_truth_sel["timestamp"], errors="coerce")
+    df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"], errors="coerce")
     return df_truth_sel, df_pred_sel
 
 def _coerce_ts64(df: pd.DataFrame) -> pd.DataFrame:
