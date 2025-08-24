@@ -32,7 +32,7 @@ GRAD_CLIP_NORM  = 5.0
 
 # ---------- Masking for SSL ----------
 MASK_MODE               = "span"   # "random" or "span"
-MASK_RATIO              = 0.30     # fraction of timesteps masked per window
+MASK_RATIO              = 0.15     # fraction of timesteps masked per window (lighter masking for better context)
 SPAN_LEN                = 4        # used if MASK_MODE=="span": contiguous length per span
 
 # For contrastive views (lighter masking by default)
@@ -41,15 +41,15 @@ VIEW_MASK_RATIO         = 0.15
 VIEW_SPAN_LEN           = 3
 
 # ---------- Contrastive (InfoNCE) ----------
-USE_CONTRASTIVE         = True
-W_CONTRAST              = 1.0
+USE_CONTRASTIVE         = False
+W_CONTRAST              = 0.0
 TAU                     = 0.2
 ADD_JITTER_STD          = 0.01
 ADD_DROPOUT_PROB        = 0.0
 CONTRAST_UPDATES_ENCODER = False
 
 # ---------- Frequency-domain augmentations ----------
-USE_FREQ_AUG            = True
+USE_FREQ_AUG            = False
 FREQ_AUG_PROB           = 0.8
 FREQ_AMP_STD            = 0.10
 FREQ_PHASE_STD          = 0.20
@@ -61,10 +61,10 @@ FREQ_SHELF_PROB         = 0.3
 FREQ_SHELF_STRENGTH     = (0.3, 0.8)
 
 # ---------- Multitask loss weights ----------
-W_SSL       = 1.0
-W_FORECAST  = 1.0
-W_OUTAGE_SSL      = 0.5
-W_OUTAGE_FORECAST = 1.0
+W_SSL       = 0.5
+W_FORECAST  = 2.0
+W_OUTAGE_SSL      = 0.25
+W_OUTAGE_FORECAST = 2.0
 
 # ---------- CB + PEFT (LoRA) ----------
 CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"
@@ -84,7 +84,7 @@ CALM_N         = 10
 BEST_BY        = "overall"  # "overall" | "calm" | "storm" | "loss"
 
 # ---------- TSMixup ----------
-TSMIXUP_PROB       = 0.5
+TSMIXUP_PROB       = 0.2
 TSMIXUP_K_MAX      = 3
 TSMIXUP_ALPHA      = 1.5
 TSMIXUP_SEGMENT    = False
