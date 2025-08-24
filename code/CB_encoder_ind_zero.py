@@ -13,8 +13,8 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-# OUT_DIR   = "results_seq_mse_pre-patch_zero/"
-OUT_DIR   = "results_seq_mse_non-pre/"
+OUT_DIR   = "results_seq_mse_pre-patch_zero/"
+# OUT_DIR   = "results_seq_mse_non-pre/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training hyperparameters
@@ -46,12 +46,12 @@ STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
 STEM_DROPOUT  = 0.03   # lighter dropout
 
 # === Pretrained encoder options (NEW) ===
-PRETRAINED_ENCODER_PATH = None  # "results_seq/pretrained_patchtst_validation.pt"
+PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
 ENCODER_LR              = 3e-4  # allow modest encoder fine-tuning
 FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
-USE_CB_ENCODER          = False
+USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
 CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
