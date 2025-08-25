@@ -54,7 +54,8 @@ FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
-CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
+# CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
+CB_ENCODER_CKPT = "results_lora_variables-only/pretrained_cb_encoder_peft_independent_H24.pt"
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 
@@ -1031,8 +1032,8 @@ def main():
         ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
     )
-    # mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
-    mdl24 = None
+    mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
+    # mdl24 = None
 
     # ==== 48h ====
     X48, Y48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)

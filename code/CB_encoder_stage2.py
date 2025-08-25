@@ -1,3 +1,6 @@
+# (full updated CB_encoder_stage2.py)
+# -- snip: imports and config unchanged except as noted --
+
 import os
 from tqdm import tqdm
 import numpy as np
@@ -51,12 +54,23 @@ FREEZE_ENCODER          = False
 USE_CB_ENCODER          = True
 CB_ENCODER_CKPT         = "results_lora_109/pretrained_cb_encoder_peft_independent_H24.pt"
 
-# === NEW: Gating classifier from pretraining ===
-USE_CLASSIFIER_GATING   = True        # enable two-stage gating
-CLS_FROM_CKPT           = CB_ENCODER_CKPT   # same ckpt that saved cls_head_state_dict
-CLS_THRESHOLD           = 0.5         # hard gating threshold
-GATING_MODE             = "soft"      # "soft" (weight loss by p) or "hard" (mask by threshold)
+# === Gating classifier from pretraining (upgraded) ===
+USE_CLASSIFIER_GATING   = True
+CLS_FROM_CKPT           = CB_ENCODER_CKPT
+GATING_MODE             = "soft"      # "soft" (weight loss by p) or "hard" (mask by threshold) during training
 STOP_GRAD_GATING        = True        # classifier is frozen; no grads to it
+
+# NEW: classifier pooling & spatial mixing
+CLASSIFIER_POOL         = "attn"      # "attn" (temporal attention) or "last" (last-step features)
+CLASSIFIER_SPATIAL_MIX  = True        # light cross-node mixing per horizon inside classifier
+
+# NEW: threshold auto-tuning on validation
+AUTO_TUNE_THRESHOLD     = True
+ZERO2NONZERO_TARGET     = 0.20        # cap FP-rate on true zeros (Zero→Nonzero)
+THRESH_GRID             = np.linspace(0.05, 0.95, 19).tolist()
+
+# default threshold (overwritten if AUTO_TUNE_THRESHOLD=True)
+CLS_THRESHOLD           = 0.5
 
 # === Day split for in-train validation ===
 TRAIN_LAST_DAY = 80
@@ -247,33 +261,111 @@ class ChronosBoltEncoderPEFT(nn.Module):
         h = h_bn.view(B, N, T, self.d_model).permute(0, 2, 1, 3)
         return h
 
-# -------- NEW: Outage classifier module (loads head from pretraining ckpt) --------
+# -------- NEW: Tiny temporal attention + optional spatial mixing for classifier --------
+class TemporalAttentionPool(nn.Module):
+    """
+    One-query-per-horizon temporal attention.
+    Input h: (B, T, N, D) -> returns ctx: (B, N, H, D)
+    """
+    def __init__(self, d_model, horizon):
+        super().__init__()
+        self.d = d_model
+        self.horizon = horizon
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Q  = nn.Parameter(torch.randn(horizon, d_model) / math.sqrt(d_model))
+
+    def forward(self, h):
+        # h: (B,T,N,D)
+        B, T, N, D = h.shape
+        k = self.Wk(h)                           # (B,T,N,D)
+        v = self.Wv(h)                           # (B,T,N,D)
+        # scores: (B,N,H,T)
+        scores = torch.einsum("hd,btnd->bnht", self.Q, k) / math.sqrt(D)
+        attn = torch.softmax(scores, dim=-1)     # (B,N,H,T)
+        # ctx: (B,N,H,D)
+        ctx = torch.einsum("bnht,btnd->bnhd", attn, v)
+        return ctx
+
+class SpatialMix(nn.Module):
+    """
+    Light cross-node mixing per horizon via self-attention across nodes.
+    Input ctx: (B, N, H, D) -> returns mixed: (B, N, H, D)
+    """
+    def __init__(self, d_model, dropout=0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, ctx):
+        B, N, H, D = ctx.shape
+        x = ctx.permute(0, 2, 1, 3).reshape(B * H, N, D)  # (B*H, N, D)
+        scores = torch.einsum("bnd,bmd->bnm", x, x) / math.sqrt(D)  # (B*H, N, N)
+        A = torch.softmax(scores, dim=-1)
+        mixed = torch.einsum("bnm,bmd->bnd", A, x)                  # (B*H, N, D)
+        mixed = mixed.view(B, H, N, D).permute(0, 2, 1, 3)          # (B,N,H,D)
+        out = self.gamma * self.dropout(mixed) + (1.0 - self.gamma) * ctx
+        return out
+
+# -------- NEW: Outage classifier module --------
 class CBOutageClassifier(nn.Module):
     """
-    Uses the same CB encoder (LoRA) and the saved 'cls_head_state_dict' from pretraining
-    to produce logits for outage (>0) over H steps. Input is WEATHER-ONLY context
-    (we zero the outage channel).
+    LoRA CB encoder + classification head for outage(>0) over H steps.
+    Pooling: 'attn' (temporal attention) or 'last'
+    Optional spatial mixing across nodes per horizon.
     """
-    def __init__(self, in_channels, horizon, ckpt_path):
+    def __init__(self, in_channels, horizon, ckpt_path,
+                 pooling=CLASSIFIER_POOL, spatial_mix=CLASSIFIER_SPATIAL_MIX):
         super().__init__()
+        assert pooling in ("attn", "last")
+        self.pooling = pooling
+        self.spatial_mix_enabled = spatial_mix
+
         self.encoder = ChronosBoltEncoderPEFT(in_channels=in_channels, ckpt_path=ckpt_path)
         d = self.encoder.d_model
-        self.cls_head = nn.Sequential(
-            nn.Linear(d, 2 * d),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(2 * d, horizon)
-        )
-        # try loading classifier head
-        ck = torch.load(ckpt_path, map_location="cpu")
-        if "cls_head_state_dict" in ck:
-            try:
-                self.cls_head.load_state_dict(ck["cls_head_state_dict"], strict=True)
-                print(f"[Classifier] Loaded classifier head from {ckpt_path}")
-            except Exception as e:
-                print(f"[Classifier] Warning: failed to load classifier head: {e}")
+
+        if self.pooling == "attn":
+            self.temporal_pool = TemporalAttentionPool(d_model=d, horizon=horizon)
+            if spatial_mix:
+                self.spatial = SpatialMix(d_model=d, dropout=0.05)
+            self.cls_head_attn = nn.Sequential(
+                nn.Linear(d, d),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(d, 1)
+            )
         else:
-            print(f"[Classifier] No 'cls_head_state_dict' found in {ckpt_path}; using randomly initialized head.")
+            self.temporal_pool = None
+            self.spatial = SpatialMix(d_model=d, dropout=0.05) if spatial_mix else None
+            self.cls_head = nn.Sequential(
+                nn.Linear(d, 2 * d),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(2 * d, horizon)
+            )
+
+        # Try loading heads from ckpt if available (shape must match)
+        ck = torch.load(ckpt_path, map_location="cpu")
+        if self.pooling == "attn":
+            key = "cls_head_attn_state_dict"
+            if key in ck:
+                try:
+                    self.cls_head_attn.load_state_dict(ck[key], strict=True)
+                    print(f"[Classifier] Loaded attention head from {ckpt_path}")
+                except Exception as e:
+                    print(f"[Classifier] Warning: failed to load attention head: {e}")
+            else:
+                print(f"[Classifier] No '{key}' in {ckpt_path}; using randomly initialized attention head.")
+        else:
+            key = "cls_head_state_dict"
+            if key in ck:
+                try:
+                    self.cls_head.load_state_dict(ck[key], strict=True)
+                    print(f"[Classifier] Loaded classifier head from {ckpt_path}")
+                except Exception as e:
+                    print(f"[Classifier] Warning: failed to load classifier head: {e}")
+            else:
+                print(f"[Classifier] No '{key}' found in {ckpt_path}; using randomly initialized head.")
 
         # freeze by default (two-stage)
         for p in self.parameters():
@@ -283,16 +375,27 @@ class CBOutageClassifier(nn.Module):
     @torch.no_grad()
     def forward(self, x):
         """
-        x: (B,T,N,F) scaled inputs
+        x: (B,T,N,F_full) scaled inputs; classifier pulls WEATHER-ONLY tail.
         returns logits: (B,H,N)
         """
-        # Classifier was trained on weather-only inputs. Feed the last F channels.
-        needF = self.encoder.in_channels  # from ckpt
+        needF = self.encoder.in_channels
         x_weather = x[..., -needF:] if x.shape[-1] != needF else x
-        h = self.encoder(x_weather)
-        pooled = h.mean(dim=1)      # (B,N,D)
-        logits = self.cls_head(pooled)  # (B,N,H)
-        return logits.permute(0, 2, 1)  # (B,H,N)
+        h = self.encoder(x_weather)   # (B,T,N,D)
+
+        if self.pooling == "attn":
+            ctx = self.temporal_pool(h)  # (B,N,H,D)
+            if self.spatial_mix_enabled:
+                ctx = self.spatial(ctx)  # (B,N,H,D)
+            logits = self.cls_head_attn(ctx).squeeze(-1)  # (B,N,H)
+            return logits.permute(0, 2, 1)                # (B,H,N)
+        else:
+            last = h[:, -1]  # (B,N,D)
+            if self.spatial_mix_enabled:
+                ctx = last[:, :, None, :]  # (B,N,1,D)
+                ctx = self.spatial(ctx)    # (B,N,1,D)
+                last = ctx[:, :, 0, :]     # (B,N,D)
+            logits = self.cls_head(last)   # (B,N,H)
+            return logits.permute(0, 2, 1) # (B,H,N)
 
 # -------------------- StemGNN blocks (unchanged) --------------------
 class _TemporalConv(nn.Module):
@@ -364,11 +467,6 @@ class _StemBlock(nn.Module):
 
 # -------------------- StemGNN Forecaster (unchanged API) --------------------
 class STGNNForecaster(nn.Module):
-    """
-    Encoder -> stacked Stem blocks -> temporal pooling -> linear readout.
-    Input:  x (B, T, N, F_in)
-    Output: (B, N, H)
-    """
     def __init__(self, in_channels, horizon, num_nodes):
         super().__init__()
         self.num_nodes   = num_nodes
@@ -426,11 +524,9 @@ class STGNNForecaster(nn.Module):
         assert N == self.num_nodes and F == self.in_channels, \
             f"StemGNN input shape mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
 
-        # h = self.patch(x)
-        # Feed only the features the encoder was pretrained on (weather-only).
         if USE_CB_ENCODER and isinstance(self.patch, ChronosBoltEncoderPEFT):
-            needF = self.patch.in_channels  # saved in ckpt (should be 109)
-            x_patch = x[..., -needF:] if x.shape[-1] != needF else x  # drop outage channel if present
+            needF = self.patch.in_channels  # weather-only encoder
+            x_patch = x[..., -needF:] if x.shape[-1] != needF else x
         else:
             x_patch = x
         h = self.patch(x_patch)
@@ -465,16 +561,8 @@ def _fit_scalers_train_only(y, w, days, train_last_day):
     return {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
 
 def prepare_training_split(ds_train, horizon, train_last_day=80):
-    """
-    Build training windows **only** whose targets lie fully within days <= train_last_day.
-    Returns:
-      X_tr: (num_windows_total, SEQ_LEN, 1, Din)    # one county per sample
-      Y_tr: (num_windows_total, 1, horizon)
-      Din, scalers (fit on train split)
-      aux: dict with arrays used for validation (scaled series, timestamps, etc.)
-    """
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
     T, N, F = w.shape
@@ -515,16 +603,52 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     }
     return X_tr, Y_tr, Din, scalers, aux
 
-# ---------------- validation roll (with optional gating) ----------------
+# ---------------- helper: truth melt + zero/nonzero ratios ----------------
+def _truth_long(df_truth_wide: pd.DataFrame) -> pd.DataFrame:
+    if df_truth_wide is None or df_truth_wide.empty:
+        return pd.DataFrame(columns=["timestamp","location","y"])
+    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
+    df_long = df_truth_wide.melt(id_vars="timestamp", value_vars=locs,
+                                 var_name="location", value_name="y").copy()
+    df_long["timestamp"] = pd.to_datetime(df_long["timestamp"])
+    df_long["location"]  = df_long["location"].astype(str)
+    return df_long
+
+def _ratio_metrics(df_truth_wide: pd.DataFrame, df_probs_long: pd.DataFrame, thr: float):
+    """
+    df_probs_long columns: [timestamp, location, p] with p in [0,1]
+    Returns (Zero->Nonzero, Nonzero->Zero, counts_zero, counts_pos)
+    """
+    if df_truth_wide.empty or df_probs_long.empty:
+        return float("nan"), float("nan"), 0, 0
+    df_t = _truth_long(df_truth_wide)
+    df_p = df_probs_long.copy()
+    df_p["timestamp"] = pd.to_datetime(df_p["timestamp"])
+    df_p["location"]  = df_p["location"].astype(str)
+    df = df_t.merge(df_p, on=["timestamp","location"], how="inner")
+    if df.empty:
+        return float("nan"), float("nan"), 0, 0
+    zero_mask = df["y"] <= 0.0
+    pos_mask  = df["y"] > 0.0
+    pred_nonzero = df["p"].values >= float(thr)
+    zeros_total = int(zero_mask.sum())
+    pos_total   = int(pos_mask.sum())
+    z2nz = float((zero_mask & pred_nonzero).sum() / zeros_total) if zeros_total > 0 else float("nan")
+    nz2z = float((pos_mask & (~pred_nonzero)).sum() / pos_total) if pos_total > 0 else float("nan")
+    return z2nz, nz2z, zeros_total, pos_total
+
+# ---------------- validation probs with spatial context ----------------
 @torch.no_grad()
-def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80,
-                     classifier=None, cls_threshold=0.5):
+def predict_val_probs(ds_train, classifier, aux, horizon, train_last_day=80):
     """
-    Rolling validation with optional two-stage gating:
-      If classifier is provided, predictions with p(nonzero) < threshold are set to 0.
+    Compute classifier probabilities for ALL nodes using spatial context, per validation day.
+    Returns a long df with [timestamp, location, p] (p=Prob(Y>0)).
     """
-    model.eval()
-    X_all = aux["X_all_scaled"]
+    if classifier is None:
+        return pd.DataFrame(columns=["timestamp","location","p"])
+    classifier.eval()
+
+    X_all = aux["X_all_scaled"]           # (T, N, Din)
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
@@ -541,40 +665,31 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80,
         fut_end   = fut_start + horizon - 1
         if start_ctx < 0 or fut_end >= len(ts):
             continue
-
         ts_future = pd.to_datetime(ts[fut_start:fut_start+horizon])
 
-        for i, county in enumerate(locs):
-            Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, Din)  # (1, T, 1, Din)
-            xb = torch.tensor(Xin_i, dtype=torch.float32, device=DEVICE)
+        Xin_all = X_all[start_ctx:end_idx+1, :, :].reshape(1, SEQ_LEN, N, Din)  # (1,T,N,Din)
+        xb_all  = torch.tensor(Xin_all, dtype=torch.float32, device=DEVICE)
+        logits  = classifier(xb_all)[0].detach().cpu().numpy()  # (H,N_probs)
+        p_all   = 1.0 / (1.0 + np.exp(-logits))                 # (H,N_probs)
 
-            # regression
-            pred_sc = model(xb)[0, 0].detach().cpu().numpy()  # (H,)
+        n_probs = p_all.shape[1]
+        n_locs  = len(locs)
+        if n_probs != n_locs:
+            use_n = min(n_probs, n_locs)
+            print(f"[Classifier] Warning: N_probs ({n_probs}) != N_locs ({n_locs}); aligning to first {use_n}.")
+        else:
+            use_n = n_locs
 
-            # gating (optional)
-            if classifier is not None:
-                logits = classifier(xb).squeeze(-1).squeeze(0).cpu().numpy()  # (H,)
-                p_nonzero = 1.0 / (1.0 + np.exp(-logits))
-                mask = (p_nonzero >= cls_threshold).astype(np.float32)
-                pred_sc = pred_sc * mask  # hard gating
-
-            # inverse scale
-            y_mu = float(scalers["y_mu"].flatten()[0])
-            y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
-            pred = (pred_sc * y_sd) + y_mu
-            pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
-
+        for i, county in enumerate(locs[:use_n]):
             rows.append(pd.DataFrame({
                 "timestamp": ts_future,
                 "location": county,
-                "pred": pred.astype(float)
+                "p": p_all[:, i].astype(float)
             }))
 
     if rows:
-        df_pred = pd.concat(rows, ignore_index=True)
-    else:
-        df_pred = pd.DataFrame(columns=["timestamp", "location", "pred"])
-    return df_pred
+        return pd.concat(rows, ignore_index=True)
+    return pd.DataFrame(columns=["timestamp","location","p"])
 
 def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
     ts    = aux["timestamps"]
@@ -690,15 +805,42 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
 
     return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
 
+# ---------------- threshold tuning ----------------
+def tune_threshold(df_truth_val, df_probs_val, target_zero2nonzero=ZERO2NONZERO_TARGET, grid=THRESH_GRID):
+    best_thr = None
+    best_tuple = (float("inf"), float("inf"))  # (penalty, nz2z)
+    best_metrics = (float("nan"), float("nan"))
+    for thr in grid:
+        z2nz, nz2z, zc, pc = _ratio_metrics(df_truth_val, df_probs_val, thr)
+        if not np.isfinite(z2nz) or not np.isfinite(nz2z):
+            continue
+        penalty = max(0.0, z2nz - target_zero2nonzero)
+        cand = (penalty, nz2z)
+        if cand < best_tuple:
+            best_tuple = cand
+            best_thr = thr
+            best_metrics = (z2nz, nz2z)
+    if best_thr is None:
+        best_thr = 0.5
+        best_metrics = _ratio_metrics(df_truth_val, df_probs_val, best_thr)[:2]
+    return float(best_thr), best_metrics
+
+def print_cls_metrics(title, df_truth_val, df_probs_val, thr):
+    z2nz, nz2z, zc, pc = _ratio_metrics(df_truth_val, df_probs_val, thr)
+    if np.isfinite(z2nz) and np.isfinite(nz2z):
+        print(f"[{title}] Classifier @ τ={thr:.2f}: Zero→Nonzero={z2nz:.4f} (all-zero=0.0000) | "
+              f"Nonzero→Zero={nz2z:.4f} (all-zero=1.0000) "
+              f"[zeros={zc}, positives={pc}]")
+    else:
+        print(f"[{title}] Classifier @ τ={thr:.2f}: Zero→Nonzero=nan | Nonzero→Zero=nan")
+
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                               train_last_day=80,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan"),
-                              classifier=None, cls_threshold=0.5):
-    """
-    Evaluate each epoch on rolling day-ahead validation **with optional gating**.
-    """
+                              classifier=None, cls_threshold=0.5,
+                              df_truth_val_cached=None, df_probs_val_cached=None):
     best = {"rmse": float("inf"), "epoch": -1}
-    df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
+    df_truth_val = df_truth_val_cached if df_truth_val_cached is not None else truth_wide_for_val(ds_train, aux, horizon, train_last_day)
 
     def _callback(model, epoch):
         df_pred_val = predict_val_roll(
@@ -733,6 +875,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         else:
             print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
 
+        if classifier is not None and df_probs_val_cached is not None:
+            print_cls_metrics(f"Val {label} Classify", df_truth_val, df_probs_val_cached, cls_threshold)
+
         metric_map = {"overall": rmse_overall, "calm": rmse_calm, "storm": rmse_storm}
         sel = metric_map.get(str(BEST_BY).lower(), rmse_overall)
         sel_val = sel if np.isfinite(sel) else rmse_overall
@@ -756,7 +901,6 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-        # ---- Optional test at each epoch ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test,
                                               classifier=classifier, cls_threshold=cls_threshold)
@@ -766,12 +910,73 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
 
     return _callback
 
+# ---------------- validation roll (with spatial gating, SAFE alignment) ----------------
+@torch.no_grad()
+def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80,
+                     classifier=None, cls_threshold=0.5):
+    model.eval()
+    X_all = aux["X_all_scaled"]
+    ts    = aux["timestamps"]
+    days  = aux["days"]
+    day_end_idx = aux["day_end_idx"]
+    N = X_all.shape[1]
+    Din = X_all.shape[2]
+    locs = list(map(str, ds_train.location.values))
+    n_locs = len(locs)
+
+    rows = []
+    last_day = int(days.max())
+    for d in range(train_last_day, last_day):
+        end_idx = day_end_idx[d - 1]
+        start_ctx = end_idx - (SEQ_LEN - 1)
+        fut_start = end_idx + 1
+        fut_end   = fut_start + horizon - 1
+        if start_ctx < 0 or fut_end >= len(ts):
+            continue
+
+        ts_future = pd.to_datetime(ts[fut_start:fut_start+horizon])
+
+        # classifier once for all nodes (spatial context)
+        if classifier is not None:
+            Xin_all = X_all[start_ctx:end_idx+1, :, :].reshape(1, SEQ_LEN, N, Din)
+            xb_all  = torch.tensor(Xin_all, dtype=torch.float32, device=DEVICE)
+            logits_all = classifier(xb_all)[0].detach().cpu().numpy()  # (H,N_probs)
+            p_all = 1.0 / (1.0 + np.exp(-logits_all))                  # (H,N_probs)
+            n_probs = p_all.shape[1]
+            if n_probs != n_locs:
+                print(f"[Classifier] Warning: N_probs ({n_probs}) != N_locs ({n_locs}); gating aligned by index where available.")
+        else:
+            p_all = None
+            n_probs = 0
+
+        for i, county in enumerate(locs):
+            Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, Din)
+            pred_sc = model(torch.tensor(Xin_i, dtype=torch.float32, device=DEVICE))[0, 0].detach().cpu().numpy()  # (H,)
+
+            if p_all is not None and i < n_probs:
+                mask_vec = (p_all[:, i] >= float(cls_threshold)).astype(np.float32)
+                pred_sc = pred_sc * mask_vec  # hard gating
+            # else: no gating for this node if classifier didn't produce it
+
+            y_mu = float(scalers["y_mu"].flatten()[0])
+            y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
+            pred = (pred_sc * y_sd) + y_mu
+            pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+
+            rows.append(pd.DataFrame({
+                "timestamp": ts_future,
+                "location": county,
+                "pred": pred.astype(float)
+            }))
+
+    if rows:
+        df_pred = pd.concat(rows, ignore_index=True)
+    else:
+        df_pred = pd.DataFrame(columns=["timestamp", "location", "pred"])
+    return df_pred
+
 # ---------------- training/infer (with optional gating in loss/infer) ----------------
 def _masked_mse(pred, target, weight_or_mask):
-    """
-    pred, target: (B,N,H)
-    weight_or_mask: (B,N,H) weights (soft) or mask {0,1} (hard)
-    """
     se = (pred - target) ** 2
     w = weight_or_mask
     num = (se * w).sum()
@@ -779,12 +984,6 @@ def _masked_mse(pred, target, weight_or_mask):
     return num / denom
 
 def train_model(X, Y, din, horizon, n_nodes, eval_callback=None, classifier=None, gating_mode="soft", cls_threshold=0.5):
-    """
-    X: (num_samples, SEQ_LEN, N, din)
-    Y: (num_samples, N, horizon)
-    classifier: optional CBOutageClassifier used for gating the regression loss
-    gating_mode: "soft" weights loss by p(nonzero) ; "hard" keeps only steps with p>=threshold
-    """
     if len(X) == 0:
         return None
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
@@ -809,7 +1008,6 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None, classifier=None
 
     mse = nn.MSELoss()
 
-    # classifier on device, frozen
     if classifier is not None:
         classifier.to(DEVICE)
         classifier.eval()
@@ -830,20 +1028,19 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None, classifier=None
                     xb = xb * (1.0 - drop_mask)
 
             opt.zero_grad()
-            pred = model(xb)                       # (B,1,H)
+            pred = model(xb)  # (B,1,H)
 
             if classifier is None:
                 loss = mse(pred, yb)
             else:
                 with torch.no_grad():
-                    logits = classifier(xb)  # (B,H,1)
+                    logits = classifier(xb)  # (B,H,1) because N=1 in training
                     p = torch.sigmoid(logits)  # (B,H,1)
                     if gating_mode == "hard":
                         w = (p >= cls_threshold).float()
                     else:
                         w = p  # soft weighting
-                # reshape to (B,1,H) -> (B,1,H)
-                loss = _masked_mse(pred, yb, w.permute(0,2,1))
+                loss = _masked_mse(pred, yb, w.permute(0,2,1))  # (B,1,H)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -869,39 +1066,44 @@ def prepare_training(ds_train, horizon):
     X, Y, Din, scalers, aux = prepare_training_split(ds_train, horizon, TRAIN_LAST_DAY)
     return X, Y, Din, scalers, aux
 
-# ---------------- test-time prediction (per-county, with optional gating) ----------------
+# ---------------- test-time prediction (per-county, with spatial gating SAFE) ----------------
+@torch.no_grad()
 def predict_per_county(ds_train, model, scalers, horizon, ts_future, classifier=None, cls_threshold=0.5):
     locs = list(map(str, ds_train.location.values))
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     T, N, F = w.shape
     Din = 1 + F
 
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)   # (T, N, Din)
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
+
+    if classifier is not None and T >= SEQ_LEN:
+        Xin_all = X_all[-SEQ_LEN:, :, :].reshape(1, SEQ_LEN, N, Din)
+        xb_all  = torch.tensor(Xin_all, dtype=torch.float32, device=DEVICE)
+        logits_all = classifier(xb_all)[0].detach().cpu().numpy()  # (H,N_probs)
+        p_all  = 1.0 / (1.0 + np.exp(-logits_all))
+        n_probs = p_all.shape[1]
+        n_locs  = len(locs)
+        if n_probs != n_locs:
+            print(f"[Classifier] Warning: N_probs ({n_probs}) != N_locs ({n_locs}); gating aligned by index where available.")
+    else:
+        p_all = None
+        n_probs = 0
 
     rows = []
     for i, county in enumerate(locs):
         if T < SEQ_LEN:
             pred_sc = np.zeros(horizon, dtype=float)
         else:
-            Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)  # (1, T, 1, Din)
-            xb = torch.tensor(Xin_i, dtype=torch.float32, device=DEVICE)
-
-            # regression
-            pred_sc = infer(model, Xin_i)[0, 0]  # (H,)
-
-            # gating
-            if classifier is not None:
-                logits = classifier(xb).squeeze(-1).squeeze(0).cpu().numpy()  # (H,)
-                p_nonzero = 1.0 / (1.0 + np.exp(-logits))
-                mask = (p_nonzero >= cls_threshold).astype(np.float32)
-                pred_sc = pred_sc * mask
+            Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
+            pred_sc = infer(model, Xin_i)[0, 0]
+            if p_all is not None and i < n_probs:
+                pred_sc = pred_sc * (p_all[:, i] >= float(cls_threshold)).astype(np.float32)
 
         pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
         pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
-
         rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
     return pd.concat(rows, ignore_index=True)
 
@@ -928,39 +1130,65 @@ def main():
     X24, Y24, Din, scalers24, aux24 = prepare_training(ds_train, horizon=H24)
     n_nodes = 1  # single-node per sample
 
-    # ---- NEW: build classifier for gating ----
     if USE_CLASSIFIER_GATING and os.path.exists(CLS_FROM_CKPT):
-        classifier24 = CBOutageClassifier(in_channels=Din, horizon=H24, ckpt_path=CLS_FROM_CKPT).to(DEVICE)
+        classifier24 = CBOutageClassifier(
+            in_channels=Din, horizon=H24, ckpt_path=CLS_FROM_CKPT,
+            pooling=CLASSIFIER_POOL, spatial_mix=CLASSIFIER_SPATIAL_MIX
+        ).to(DEVICE)
     else:
         classifier24 = None
         if USE_CLASSIFIER_GATING:
             print(f"[Classifier] Warning: ckpt not found at {CLS_FROM_CKPT}. Gating disabled.")
 
+    df_truth_val24 = truth_wide_for_val(ds_train, aux24, H24, TRAIN_LAST_DAY)
+    if classifier24 is not None and AUTO_TUNE_THRESHOLD:
+        df_probs_val24 = predict_val_probs(ds_train, classifier24, aux24, H24, TRAIN_LAST_DAY)
+        best_tau24, (z2nz24, nz2z24) = tune_threshold(df_truth_val24, df_probs_val24, ZERO2NONZERO_TARGET, THRESH_GRID)
+        print_cls_metrics("Tuning 24h", df_truth_val24, df_probs_val24, best_tau24)
+        tau24 = best_tau24
+    else:
+        df_probs_val24 = None
+        tau24 = CLS_THRESHOLD
+
     val_cb24 = make_val_callback_rolling(
         ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24,
-        classifier=classifier24, cls_threshold=CLS_THRESHOLD
+        classifier=classifier24, cls_threshold=tau24,
+        df_truth_val_cached=df_truth_val24, df_probs_val_cached=df_probs_val24
     )
     mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24,
-                        classifier=classifier24, gating_mode=GATING_MODE, cls_threshold=CLS_THRESHOLD)
+                        classifier=classifier24, gating_mode=GATING_MODE, cls_threshold=tau24)
 
     # ==== 48h ====
     X48, Y48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)
     if USE_CLASSIFIER_GATING and os.path.exists(CLS_FROM_CKPT):
-        classifier48 = CBOutageClassifier(in_channels=Din, horizon=H48, ckpt_path=CLS_FROM_CKPT).to(DEVICE)
+        classifier48 = CBOutageClassifier(
+            in_channels=Din, horizon=H48, ckpt_path=CLS_FROM_CKPT,
+            pooling=CLASSIFIER_POOL, spatial_mix=CLASSIFIER_SPATIAL_MIX
+        ).to(DEVICE)
     else:
         classifier48 = None
+
+    df_truth_val48 = truth_wide_for_val(ds_train, aux48, H48, TRAIN_LAST_DAY)
+    if classifier48 is not None and AUTO_TUNE_THRESHOLD:
+        df_probs_val48 = predict_val_probs(ds_train, classifier48, aux48, H48, TRAIN_LAST_DAY)
+        best_tau48, (z2nz48, nz2z48) = tune_threshold(df_truth_val48, df_probs_val48, ZERO2NONZERO_TARGET, THRESH_GRID)
+        print_cls_metrics("Tuning 48h", df_truth_val48, df_probs_val48, best_tau48)
+        tau48 = best_tau48
+    else:
+        df_probs_val48 = None
+        tau48 = CLS_THRESHOLD
 
     val_cb48 = make_val_callback_rolling(
         ds_train, scalers48, H48, aux48, label="48h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48,
-        classifier=classifier48, cls_threshold=CLS_THRESHOLD
+        classifier=classifier48, cls_threshold=tau48,
+        df_truth_val_cached=df_truth_val48, df_probs_val_cached=df_probs_val48
     )
     mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48,
-                        classifier=classifier48, gating_mode=GATING_MODE, cls_threshold=CLS_THRESHOLD)
+                        classifier=classifier48, gating_mode=GATING_MODE, cls_threshold=tau48)
 
     # ----- Test evaluation using best models, then write CSVs -----
-    # 24h
     if mdl24 is not None:
         best24_path = os.path.join(OUT_DIR, "best_enc-dec_24h.pt")
         if os.path.exists(best24_path):
@@ -976,13 +1204,12 @@ def main():
             except Exception as e:
                 print(f"[24h] Warning: failed to load best checkpoint: {e}")
         df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24,
-                                  classifier=classifier24, cls_threshold=CLS_THRESHOLD)
+                                  classifier=classifier24, cls_threshold=tau24)
         test_rmse_24 = per_county_rmse_mean(df_t24, df24)
         print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
     else:
         df24 = None
 
-    # 48h
     if mdl48 is not None:
         best48_path = os.path.join(OUT_DIR, "best_enc-dec_48h.pt")
         if os.path.exists(best48_path):
@@ -998,13 +1225,12 @@ def main():
             except Exception as e:
                 print(f"[48h] Warning: failed to load best checkpoint: {e}")
         df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48,
-                                  classifier=classifier48, cls_threshold=CLS_THRESHOLD)
+                                  classifier=classifier48, cls_threshold=tau48)
         test_rmse_48 = per_county_rmse_mean(df_t48, df48)
         print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
     else:
         df48 = None
 
-    # Fallbacks
     if df24 is None:
         locs = list(map(str, ds_train.location.values))
         df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),

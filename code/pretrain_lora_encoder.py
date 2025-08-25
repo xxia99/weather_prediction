@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 # Config
 # =========================
 SPLIT_DIR   = "data/"
-OUT_DIR     = "results_lora_two-stage/"
+OUT_DIR     = "results_lora_variables-only/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 DEVICE = "cuda:3" if torch.cuda.is_available() else "cpu"
@@ -63,9 +63,9 @@ FREQ_SHELF_PROB         = 0.3
 FREQ_SHELF_STRENGTH     = (0.3, 0.8)
 
 # ---------- Multitask loss weights ----------
-W_SSL       = 1.0   # masked reconstruction loss weight
-W_FORECAST  = 1.0   # next-H forecasting loss weight
-# Extra emphasis on outage channel (index 0)
+W_SSL       = 1.0   # masked reconstruction loss weight (weather-only)
+W_FORECAST  = 1.0   # next-H forecasting loss weight (weather-only)
+# Extra emphasis on outage channel (index 0) -- NOT USED now since we don't reconstruct/forecast outage
 W_OUTAGE_SSL      = 0#0.5
 W_OUTAGE_FORECAST = 0#1.0
 
@@ -84,7 +84,7 @@ LORA_DROPOUT    = 0.05
 # ---------- Train/Val split by days ----------
 TRAIN_LAST_DAY = 80  # use days 1..80 for training; 81..end for day-ahead validation
 
-# ---------- Event-stratified validation (Calm/Storm + all-zero baselines) ----------
+# ---------- Event-stratified validation (kept but unused now) ----------
 EVENT_METHOD   = "mean"   # or "max" for day score
 STORM_TOP_Q    = 0.80     # top 20% days considered "stormy"
 CALM_BOTTOM_Q  = 0.50     # bottom 50% pool for calm sampling
@@ -144,23 +144,23 @@ def channel_mse(pred, target, mask=None, ch=0):
 def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last_day=80):
     """
     Build training windows for **independent locations**:
-      X_tr: (nW*N, seq_len, 1, Din)
-      Y_tr: (nW*N, horizon, 1, Din)
+      X_tr: (nW*N, seq_len, 1, Din=110)
+      Y_tr: (nW*N, horizon, 1, Din=110)
     Fit scalers on training portion only (days <= train_last_day).
     """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F=109)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
 
     T, N, F = w.shape
-    Din = 1 + F
+    Din = 1 + F  # keep input at 110 (1 outage + 109 weather)
 
     # train-only scalers
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)    # (T, N)
-    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                             # (T, N, Din)
+    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, 109)
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                             # (T, N, 110)
 
     nW_total = T - seq_len - horizon + 1
     if nW_total <= 0:
@@ -171,12 +171,12 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
 
     X_list, Y_list = [], []
     for node in range(N):
-        x_loc = X_all[:, node, :]  # (T, Din)
-        Xw = np.stack([x_loc[i:i+seq_len] for i in range(nW_total)], axis=0)                  # (nW_total, seq_len, Din)
-        Yw = np.stack([X_all[i+seq_len:i+seq_len+horizon, node, :] for i in range(nW_total)], axis=0)  # (nW_total, H, Din)
+        x_loc = X_all[:, node, :]  # (T, 110)
+        Xw = np.stack([x_loc[i:i+seq_len] for i in range(nW_total)], axis=0)                  # (nW_total, seq_len, 110)
+        Yw = np.stack([X_all[i+seq_len:i+seq_len+horizon, node, :] for i in range(nW_total)], axis=0)  # (nW_total, H, 110)
         if nW_train > 0:
-            X_list.append(Xw[:nW_train][:, :, None, :])   # (nW_train, seq_len, 1, Din)
-            Y_list.append(Yw[:nW_train][:, :, None, :])   # (nW_train, H, 1, Din)
+            X_list.append(Xw[:nW_train][:, :, None, :])   # (nW_train, seq_len, 1, 110)
+            Y_list.append(Yw[:nW_train][:, :, None, :])   # (nW_train, H, 1, 110)
 
     if not X_list:
         X_tr = np.empty((0, seq_len, 1, Din), dtype=float)
@@ -186,7 +186,7 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
         Y_tr = np.concatenate(Y_list, axis=0)
 
     aux = {
-        "X_all_scaled": X_all,     # (T, N, Din)
+        "X_all_scaled": X_all,     # (T, N, 110)
         "y_scaled": y_sc,          # (T, N)
         "timestamps": ts,          # (T,)
         "days": days,              # (T,)
@@ -195,7 +195,7 @@ def prepare_multitask_windows_split(ds_train, seq_len=24, horizon=24, train_last
     return X_tr, Y_tr, Din, scalers, aux
 
 def build_val_windows_day_ahead(aux, horizon, seq_len, train_last_day=80):
-    X_all = aux["X_all_scaled"]           # (T, N, Din)
+    X_all = aux["X_all_scaled"]           # (T, N, 110)
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
@@ -405,29 +405,32 @@ class ChronosBoltEncoderPEFT(nn.Module):
 class MultiTaskCBEncoder(nn.Module):
     """
     Encoder + heads:
-      - recon_head: reconstruct inputs at masked timesteps (SSL)
-      - forecast_head: predict next H steps of full multivariate inputs
-      - proj_head: projection for InfoNCE (contrastive)
-      - NEW cls_head: predict outage occurrence (>0) for next H steps, using WEATHER-ONLY context
+      - recon_head: reconstruct **weather-only (109)** at masked timesteps
+      - forecast_head: predict next H steps of **weather-only (109)**
+      - proj_head: projection for InfoNCE (contrastive, optional)
+      - cls_head: predict outage occurrence (>0) for next H steps, using WEATHER-ONLY context
     """
     def __init__(self, in_channels, horizon):
         super().__init__()
         self.horizon = horizon
+        self.in_channels = in_channels            # 110
+        self.weather_dim = in_channels - 1        # 109
         self.encoder = ChronosBoltEncoderPEFT(in_channels=in_channels, d_out=D_OUT)
 
-        self.recon_head = nn.Linear(D_OUT, in_channels)
+        # weather-only heads
+        self.recon_head = nn.Linear(D_OUT, self.weather_dim)  # 109
         self.forecast_head = nn.Sequential(
             nn.Linear(D_OUT, 2 * D_OUT),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(2 * D_OUT, horizon * in_channels)
+            nn.Linear(2 * D_OUT, horizon * self.weather_dim)  # H * 109
         )
         self.proj_head = nn.Sequential(
             nn.Linear(D_OUT, D_OUT),
             nn.GELU(),
             nn.Linear(D_OUT, D_OUT)
         )
-        # ------- NEW: binary classifier for outages (>0) over the next H steps -------
+        # binary classifier for outages (>0) over the next H steps (weather-only context)
         self.cls_head = nn.Sequential(
             nn.Linear(D_OUT, 2 * D_OUT),
             nn.GELU(),
@@ -440,11 +443,11 @@ class MultiTaskCBEncoder(nn.Module):
 
     def forward(self, x):
         h = self.encoder(x)                    # (B, T, N, D_OUT)
-        recon = self.recon_head(h)             # (B, T, N, F)
+        recon = self.recon_head(h)             # (B, T, N, 109)
         pooled = h.mean(dim=1)                 # (B, N, D_OUT)
-        fut = self.forecast_head(pooled)       # (B, N, H*F)
+        fut = self.forecast_head(pooled)       # (B, N, H*109)
         B, N, _ = fut.shape
-        fut = fut.view(B, N, self.horizon, -1).permute(0, 2, 1, 3)  # (B, H, N, F)
+        fut = fut.view(B, N, self.horizon, self.weather_dim).permute(0, 2, 1, 3)  # (B, H, N, 109)
         return recon, fut
 
     def pooled_projection(self, x):
@@ -454,10 +457,10 @@ class MultiTaskCBEncoder(nn.Module):
         z = F.normalize(z, dim=-1)
         return z
 
-    # ------- NEW: produce outage logits from WEATHER-ONLY context -------
+    # ------- produce outage logits from WEATHER-ONLY context -------
     def outage_logits_from_weather(self, x):
         """
-        x: (B,T,N,F) scaled inputs (outage channel is index 0).
+        x: (B,T,N,110) scaled inputs (outage channel is index 0).
         We zero the outage channel -> weather-only.
         Returns: logits (B, H, N)
         """
@@ -472,11 +475,20 @@ class MultiTaskCBEncoder(nn.Module):
 # Losses
 # =========================
 def masked_recon_loss(pred, target, mask):
+    """
+    pred:   (B,T,N,109)  weather-only reconstruction
+    target: (B,T,N,109)
+    mask:   (B,T,1,1)    time mask
+    """
     m = mask.expand_as(pred)
     denom = m.sum().clamp_min(1.0)
     return ((pred - target) ** 2 * m).sum() / denom
 
 def forecast_loss(pred, target):
+    """
+    pred:   (B,H,N,109)  weather-only forecast
+    target: (B,H,N,109)
+    """
     return torch.mean((pred - target) ** 2)
 
 def info_nce_loss(z1, z2, tau=0.2):
@@ -673,7 +685,7 @@ def tsmixup_batch(
     return xb_out, yb_out
 
 # =========================
-# Small eval helpers for rolling validation
+# Small eval helpers (kept for compatibility; RMSE not used here)
 # =========================
 def _pivot_pred_long_to_wide(df_long: pd.DataFrame, locs: list[str]) -> pd.DataFrame:
     if df_long.empty:
@@ -707,50 +719,26 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     })
     return _per_county_rmse_mean(df_truth_wide, df_zero_long)
 
-# ------- NEW: zero/nonzero ratio helper -------
-def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame, thr: float = 0.0):
+# ------- zero/nonzero ratio helper (for classifier) -------
+def _zero_nonzero_ratios_from_logits(logits, y_true_bin, thr=0.5):
     """
-    Computes:
-      Zero→Nonzero = P(pred>thr | truth==0)  (false positive rate among true zeros)
-      Nonzero→Zero = P(pred==0 | truth>thr)  (false negative rate among true nonzeros)
-    Both computed on the intersection (merge) of timestamps/locations.
-    Also returns the same ratios for an all-zero baseline.
+    logits: (num_batches, H) or (B,H,N) flattened -> probabilities for non-zero
+    y_true_bin: same shape, 0/1 ground truth
+    Returns Zero→Nonzero and Nonzero→Zero.
     """
-    if df_truth_wide.empty or df_pred_long.empty:
-        return float("nan"), float("nan"), float("nan"), float("nan")
+    p = torch.sigmoid(logits)
+    pred = (p >= thr).to(torch.int)
+    true = y_true_bin.to(torch.int)
 
-    # melt truth to long
-    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
-    truth_long = df_truth_wide.melt(id_vars="timestamp", value_vars=locs,
-                                    var_name="location", value_name="true").copy()
-    # ensure dtypes
-    truth_long["timestamp"] = pd.to_datetime(truth_long["timestamp"])
-    df_pred = df_pred_long.copy()
-    df_pred["timestamp"] = pd.to_datetime(df_pred["timestamp"])
+    true_zero = (true == 0).sum().item()
+    true_nonzero = (true == 1).sum().item()
+    z2n = ((true == 0) & (pred == 1)).sum().item() / true_zero if true_zero > 0 else float("nan")
+    n2z = ((true == 1) & (pred == 0)).sum().item() / true_nonzero if true_nonzero > 0 else float("nan")
 
-    merged = truth_long.merge(df_pred, on=["timestamp", "location"], how="inner")
-    if merged.empty:
-        return float("nan"), float("nan"), float("nan"), float("nan")
-
-    true = merged["true"].astype(float).values
-    pred = merged["pred"].astype(float).values
-
-    nz_true = true > thr
-    nz_pred = pred > thr
-
-    n_true_zero = int((~nz_true).sum())
-    n_true_nonzero = int(nz_true.sum())
-
-    # current model ratios
-    z2n = float(((~nz_true) & nz_pred).sum() / n_true_zero) if n_true_zero > 0 else float("nan")
-    n2z = float((nz_true & (~nz_pred)).sum() / n_true_nonzero) if n_true_nonzero > 0 else float("nan")
-
-    # all-zero baseline: pred==0 for all -> nz_pred_baseline = False
-    nz_pred0 = np.zeros_like(nz_pred, dtype=bool)
-    z2n0 = float(((~nz_true) & nz_pred0).sum() / n_true_zero) if n_true_zero > 0 else float("nan")   # -> 0.0
-    n2z0 = float((nz_true & (~nz_pred0)).sum() / n_true_nonzero) if n_true_nonzero > 0 else float("nan")  # -> 1.0 when any nonzero exists
-
-    return z2n, n2z, z2n0, n2z0
+    # All-zero baseline: predict 0 for all
+    z2n0 = 0.0 if true_zero > 0 else float("nan")
+    n2z0 = 1.0 if true_nonzero > 0 else float("nan")
+    return float(z2n), float(n2z), float(z2n0), float(n2z0)
 
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
@@ -783,130 +771,8 @@ def _filter_truth_pred_by_days(df_truth_wide: pd.DataFrame,
         df_pred_sel["timestamp"] = pd.to_datetime(df_pred_sel["timestamp"])
     return df_truth_sel, df_pred_sel
 
-def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
-                       train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
-    rmse_overall = _per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
-    zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
-
-    rng = np.random.default_rng(seed)
-    ts = ds_train.timestamp.values
-    days, day_score = _per_day_outage_score(ds_train, method=method)
-    last_day = int(days.max())
-    tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
-    if len(tgt_days) == 0:
-        return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
-
-    tgt_scores = day_score[tgt_days - 1]
-    storm_thr = np.quantile(tgt_scores, storm_top_q)
-    calm_thr  = np.quantile(tgt_scores, calm_bottom_q)
-
-    storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
-    calm_pool  = tgt_days[tgt_scores <= calm_thr].tolist()
-    if len(calm_pool) > 0:
-        k = int(min(calm_n, len(calm_pool)))
-        calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
-    else:
-        calm_days = set()
-
-    ts_storm = _timestamps_for_days(ts, storm_days)
-    ts_calm  = _timestamps_for_days(ts, calm_days)
-
-    if len(ts_calm) > 0:
-        truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
-        rmse_calm = _per_county_rmse_mean(truth_calm, pred_calm)
-        zero_calm = _all_zero_rmse_for_truth(truth_calm)
-        n_calm = len(calm_days)
-    else:
-        rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
-
-    if len(ts_storm) > 0:
-        truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
-        rmse_storm = _per_county_rmse_mean(truth_storm, pred_storm)
-        zero_storm = _all_zero_rmse_for_truth(truth_storm)
-        n_storm = len(storm_days)
-    else:
-        rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
-
-    return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
-
-@torch.no_grad()
-def _truth_wide_for_val(ds_train, aux, horizon, train_last_day=80) -> pd.DataFrame:
-    ts    = aux["timestamps"]
-    days  = aux["days"]
-    day_end_idx = aux["day_end_idx"]
-
-    fut_indices = []
-    last_day = int(days.max())
-    for d in range(train_last_day, last_day):
-        end_idx = day_end_idx[d - 1]
-        fut_start = end_idx + 1
-        fut_end   = fut_start + horizon - 1
-        if fut_end < len(ts):
-            fut_indices.extend(list(range(fut_start, fut_start + horizon)))
-    if not fut_indices:
-        return pd.DataFrame(columns=["timestamp"])
-
-    fut_indices = sorted(set(fut_indices))
-    ts_fut = pd.to_datetime(ts[fut_indices])
-
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T, N)
-    locs = list(map(str, ds_train.location.values))
-    df = pd.DataFrame(y[fut_indices, :], columns=locs, index=ts_fut).reset_index().rename(columns={"index": "timestamp"})
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    return df
-
-@torch.no_grad()
-def _predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80) -> pd.DataFrame:
-    """
-    Rolling validation predictions with **independent** per-county inference (N=1).
-    Returns long df [timestamp, location, pred].
-    """
-    model.eval()
-    X_all = aux["X_all_scaled"]
-    ts    = aux["timestamps"]
-    days  = aux["days"]
-    day_end_idx = aux["day_end_idx"]
-
-    N = X_all.shape[1]
-    Din = X_all.shape[2]
-    locs = list(map(str, ds_train.location.values))
-
-    rows = []
-    last_day = int(days.max())
-    for d in range(train_last_day, last_day):
-        end_idx = day_end_idx[d - 1]
-        start_ctx = end_idx - (SEQ_LEN - 1)
-        fut_start = end_idx + 1
-        if start_ctx < 0 or fut_start + horizon - 1 >= len(ts):
-            continue
-
-        ts_future = pd.to_datetime(ts[fut_start:fut_start + horizon])
-
-        for i, county in enumerate(locs):
-            Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, Din)  # (1, T, 1, Din)
-            xb = torch.tensor(Xin_i, dtype=torch.float32, device=DEVICE)
-            _, fut = model(xb)                              # (1, H, 1, F)
-            fut_np = fut[0, :, 0, :].detach().cpu().numpy() # (H, F)
-            pred_sc = fut_np[:, 0]                          # outage channel -> (H,)
-
-            y_mu = float(scalers["y_mu"].flatten()[0])
-            y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
-            pred = (pred_sc * y_sd) + y_mu
-            pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
-
-            rows.append(pd.DataFrame({
-                "timestamp": ts_future,
-                "location": county,
-                "pred": pred.astype(float)
-            }))
-
-    if rows:
-        return pd.concat(rows, ignore_index=True)
-    else:
-        return pd.DataFrame(columns=["timestamp", "location", "pred"])
-
 # =========================
-# Training loop (with calm/storm reporting & BEST_BY)
+# Training loop (validate losses + classifier ratios)
 # =========================
 def train_multitask_contrast(ds_train):
     # --- Build split-aware train windows (fit scalers on days 1..80) ---
@@ -916,7 +782,7 @@ def train_multitask_contrast(ds_train):
     dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
                             torch.tensor(Y_fut_tr, dtype=torch.float32))
 
-    # Storm-aware sample weights
+    # Storm-aware sample weights (kept optional)
     if STORM_SAMPLING and len(dataset) > 0:
         with torch.no_grad():
             y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)  # (nS, H, 1)
@@ -944,10 +810,10 @@ def train_multitask_contrast(ds_train):
         else:
             loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # --- Build validation windows (day-ahead) for loss ---
+    # --- Build validation windows (day-ahead) for loss/ratios ---
     X_val, Y_val = build_val_windows_day_ahead(aux, horizon=H_PRE, seq_len=SEQ_LEN, train_last_day=TRAIN_LAST_DAY)
-    have_val_loss = X_val.shape[0] > 0
-    if have_val_loss:
+    have_val = X_val.shape[0] > 0
+    if have_val:
         val_set = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
                                 torch.tensor(Y_val, dtype=torch.float32))
         val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
@@ -963,50 +829,56 @@ def train_multitask_contrast(ds_train):
     for p in model.recon_head.parameters():         p.requires_grad = True
     for p in model.forecast_head.parameters():      p.requires_grad = True
     for p in model.proj_head.parameters():          p.requires_grad = True
-    for p in model.cls_head.parameters():           p.requires_grad = True  # NEW
+    for p in model.cls_head.parameters():           p.requires_grad = True
 
     model.encoder.print_trainable()
 
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
                            lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # Ground truth frames for rolling RMSE
-    df_truth_val = _truth_wide_for_val(ds_train, aux, H_PRE, train_last_day=TRAIN_LAST_DAY)
-    zero_rmse_val_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
-
     # BCE with class imbalance handling
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([CLS_POS_WEIGHT], device=DEVICE))
 
-    best = {"loss": float("inf"), "overall": float("inf"), "calm": float("inf"), "storm": float("inf"), "epoch": -1}
+    best = {"loss": float("inf"), "epoch": -1}
 
-    def compute_val_loss():
+    def compute_val_metrics():
         if val_loader is None:
-            return float("nan")
+            return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
         model.eval()
-        total = 0.0
-        count = 0
+        tot, cnt = 0.0, 0
+        ssl_sum, fore_sum, cls_sum = 0.0, 0.0, 0.0
+        # for ratios
+        logits_all = []
+        ycls_all   = []
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb = xb.to(DEVICE)  # (B, T, 1, F)
-                yb = yb.to(DEVICE)  # (B, H, 1, F)
+                xb = xb.to(DEVICE)  # (B, T, 1, 110)
+                yb = yb.to(DEVICE)  # (B, H, 1, 110)
 
-                Bsz, T, _, Fdim = xb.shape
+                Bsz, T, _, _ = xb.shape
                 mask_ssl = make_temporal_mask(
                     Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
                 )
                 xmasked = apply_mask(xb, mask_ssl)
-                recon, fut = model(xmasked)
 
-                # Losses
-                l_ssl  = masked_recon_loss(recon, xb, mask_ssl)
-                l_fore = forecast_loss(fut, yb)
+                recon, fut = model(xmasked)  # recon: (B,T,1,109)  fut: (B,H,1,109)
 
-                # --- NEW: classification on weather-only, target = (future outage>0) ---
-                with torch.no_grad():
-                    y_future_out = yb[..., 0]                    # (B,H,1)
-                    y_cls = (y_future_out > 0).float().squeeze(-1)  # (B,H)
+                # weather-only targets
+                xb_weather = xb[..., 1:]       # (B,T,1,109)
+                yb_weather = yb[..., 1:]       # (B,H,1,109)
+
+                l_ssl  = masked_recon_loss(recon, xb_weather, mask_ssl)
+                l_fore = forecast_loss(fut, yb_weather)
+
+                # classification (weather-only context)
+                y_future_out = yb[..., 0].squeeze(-1)          # (B,H)
+                y_cls = (y_future_out > 0).float()             # (B,H)
                 logits = model.outage_logits_from_weather(xb).squeeze(-1)  # (B,H)
                 l_cls = bce(logits, y_cls)
+
+                ssl_sum  += l_ssl.item()  * Bsz
+                fore_sum += l_fore.item() * Bsz
+                cls_sum  += l_cls.item()  * Bsz
 
                 if USE_CONTRASTIVE:
                     x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
@@ -1019,11 +891,29 @@ def train_multitask_contrast(ds_train):
                 else:
                     l_contrast = torch.tensor(0.0, device=xb.device)
 
-                l = (W_SSL * l_ssl + W_FORECAST * l_fore +
-                     W_CONTRAST * l_contrast + W_CLS * l_cls)
-                total += l.item() * xb.size(0)
-                count += xb.size(0)
-        return total / max(1, count)
+                l_total = (W_SSL * l_ssl + W_FORECAST * l_fore +
+                           W_CONTRAST * l_contrast + W_CLS * l_cls)
+
+                tot  += l_total.item() * Bsz
+                cnt  += Bsz
+
+                # collect for ratios
+                logits_all.append(logits.detach().cpu())
+                ycls_all.append(y_cls.detach().cpu())
+
+        # aggregate ratios on CPU
+        logits_cat = torch.cat(logits_all, dim=0) if logits_all else torch.empty(0)
+        ycls_cat   = torch.cat(ycls_all, dim=0)   if ycls_all   else torch.empty(0)
+        if logits_cat.numel() > 0 and ycls_cat.numel() > 0:
+            z2n, n2z, z2n0, n2z0 = _zero_nonzero_ratios_from_logits(logits_cat, ycls_cat, thr=0.5)
+        else:
+            z2n = n2z = z2n0 = n2z0 = float("nan")
+
+        return (tot / max(1, cnt),
+                ssl_sum / max(1, cnt),
+                fore_sum / max(1, cnt),
+                cls_sum / max(1, cnt),
+                z2n, n2z, z2n0, n2z0)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -1032,10 +922,10 @@ def train_multitask_contrast(ds_train):
         start = time.time()
 
         for xb, yb in tqdm(loader, desc=f"Pretrain Epoch {epoch}/{EPOCHS}", leave=False):
-            xb = xb.to(DEVICE)      # (B, T, 1, F)
-            yb = yb.to(DEVICE)      # (B, H, 1, F)
+            xb = xb.to(DEVICE)      # (B, T, 1, 110)
+            yb = yb.to(DEVICE)      # (B, H, 1, 110)
 
-            # TSMixup
+            # TSMixup (optional)
             xb, yb = tsmixup_batch(
                 xb, yb,
                 p=TSMIXUP_PROB,
@@ -1053,16 +943,18 @@ def train_multitask_contrast(ds_train):
             xmasked = apply_mask(xb, mask_ssl)
 
             opt.zero_grad()
-            recon, fut = model(xmasked)  # recon: (B,T,1,F), fut: (B,H,1,F)
+            recon, fut = model(xmasked)  # recon: (B,T,1,109), fut: (B,H,1,109)
 
-            loss_ssl  = masked_recon_loss(recon, xb, mask_ssl)
-            loss_fore = forecast_loss(fut, yb)
-            loss_ssl_out   = channel_mse(recon, xb, mask_ssl, ch=0)
-            loss_fore_out  = channel_mse(fut, yb, None, ch=0)
+            # weather-only targets
+            xb_weather = xb[..., 1:]       # (B,T,1,109)
+            yb_weather = yb[..., 1:]       # (B,H,1,109)
 
-            # --- NEW: classification loss ---
-            y_future_out = yb[..., 0]                            # (B,H,1)
-            y_cls = (y_future_out > 0).float().squeeze(-1)       # (B,H)
+            loss_ssl  = masked_recon_loss(recon, xb_weather, mask_ssl)
+            loss_fore = forecast_loss(fut, yb_weather)
+
+            # classification loss (weather-only context)
+            y_future_out = yb[..., 0].squeeze(-1)               # (B,H)
+            y_cls = (y_future_out > 0).float()                  # (B,H)
             logits = model.outage_logits_from_weather(xb).squeeze(-1)  # (B,H)
             loss_cls = bce(logits, y_cls)
 
@@ -1085,9 +977,7 @@ def train_multitask_contrast(ds_train):
                 W_SSL * loss_ssl
                 + W_FORECAST * loss_fore
                 + W_CONTRAST * loss_contrast
-                + W_OUTAGE_SSL * loss_ssl_out
-                + W_OUTAGE_FORECAST * loss_fore_out
-                + W_CLS * loss_cls  # NEW
+                + W_CLS * loss_cls
             )
 
             loss.backward()
@@ -1100,72 +990,34 @@ def train_multitask_contrast(ds_train):
         epoch_loss /= max(1, seen_samples)
         took = time.time() - start
         print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
-              f"ssl={loss_ssl.item():.6f} fore={loss_fore.item():.6f} "
-              f"cls={loss_cls.item():.6f} "
+              f"ssl(tr)={loss_ssl.item():.6f} fore(tr)={loss_fore.item():.6f} "
+              f"cls(tr)={loss_cls.item():.6f} "
               f"time={took:.2f}s | batches={len(loader)} samples={seen_samples}")
 
-        # ---------- Validation: loss ----------
-        val_loss = compute_val_loss()
+        # ---------- Validation: per-loss + classifier ratios ----------
+        (val_total, val_ssl, val_fore, val_cls,
+         z2n, n2z, z2n0, n2z0) = compute_val_metrics()
 
-        # ---------- Validation: rolling RMSE + calm/storm ----------
-        if df_truth_val is not None and not df_truth_val.empty:
-            df_pred_val = _predict_val_roll(ds_train, model, scalers, H_PRE, aux, TRAIN_LAST_DAY)
-            if not df_pred_val.empty:
-                (rmse_overall, zero_overall,
-                 rmse_calm, zero_calm, n_calm,
-                 rmse_storm, zero_storm, n_storm) = _event_rmse_blocks(
-                    ds_train, df_truth_val, df_pred_val,
-                    train_last_day=TRAIN_LAST_DAY,
-                    method=EVENT_METHOD,
-                    storm_top_q=STORM_TOP_Q,
-                    calm_bottom_q=CALM_BOTTOM_Q,
-                    calm_n=CALM_N,
-                    seed=42
-                )
-                # ------- NEW: zero/nonzero ratios on validation -------
-                z2n, n2z, z2n0, n2z0 = _zero_nonzero_ratios(df_truth_val, df_pred_val, thr=0.0)
-            else:
-                rmse_overall = rmse_calm = rmse_storm = float("nan")
-                zero_overall = zero_calm = zero_storm = float("nan")
-                n_calm = n_storm = 0
-                z2n = n2z = z2n0 = n2z0 = float("nan")
+        if np.isfinite(val_total):
+            print(f"[Pretrain Val] Epoch {epoch:02d}: "
+                  f"ValTotal={val_total:.6f} | SSL={val_ssl:.6f} | Forecast={val_fore:.6f} | Cls={val_cls:.6f}")
         else:
-            rmse_overall = rmse_calm = rmse_storm = float("nan")
-            zero_overall = zero_calm = zero_storm = float("nan")
-            n_calm = n_storm = 0
-            z2n = n2z = z2n0 = n2z0 = float("nan")
+            print(f"[Pretrain Val] Epoch {epoch:02d}: ValTotal=nan | SSL=nan | Forecast=nan | Cls=nan")
 
-        # Reporting
-        if np.isfinite(rmse_overall):
-            print(f"[Pretrain Val] Epoch {epoch:02d}: ValLoss={val_loss:.6f} | Rolling RMSE={rmse_overall:.4f} (all-zero={zero_overall:.4f})")
-        else:
-            print(f"[Pretrain Val] Epoch {epoch:02d}: ValLoss={val_loss:.6f} | Rolling RMSE=nan (all-zero=nan)")
-
-        if np.isfinite(rmse_calm):
-            print(f"[EventEval] Calm-heavy ({n_calm} days): RMSE={rmse_calm:.4f} (all-zero={zero_calm:.4f})")
-        else:
-            print(f"[EventEval] Calm-heavy: RMSE=nan (all-zero=nan)")
-
-        if np.isfinite(rmse_storm):
-            print(f"[EventEval] Storm-heavy ({n_storm} days): RMSE={rmse_storm:.4f} (all-zero={zero_storm:.4f})")
-        else:
-            print(f"[EventEval] Storm-heavy: RMSE=nan (all-zero=nan)")
-
-        # ------- NEW: print zero/nonzero ratio metrics -------
+        # ------- classification zero/nonzero ratios (validation) -------
         if np.isfinite(z2n) or np.isfinite(n2z):
-            print(f"[Pretrain Val] Zero→Nonzero={z2n:.4f} (all-zero={z2n0:.4f}) | Nonzero→Zero={n2z:.4f} (all-zero={n2z0:.4f})")
+            print(f"[Pretrain Val] Classifier ratios — Zero→Nonzero={z2n:.4f} (all-zero={z2n0:.4f}) | "
+                  f"Nonzero→Zero={n2z:.4f} (all-zero={n2z0:.4f})")
         else:
-            print(f"[Pretrain Val] Zero→Nonzero=nan (all-zero=nan) | Nonzero→Zero=nan (all-zero=nan)")
+            print(f"[Pretrain Val] Classifier ratios — Zero→Nonzero=nan (all-zero=nan) | "
+                  f"Nonzero→Zero=nan (all-zero=nan)")
 
-        # ---------- Save best by BEST_BY ----------
+        # ---------- Save best by BEST_BY ('loss' expected) ----------
         metric_map = {
-            "loss": val_loss,
-            "overall": rmse_overall,
-            "calm": rmse_calm,
-            "storm": rmse_storm
+            "loss": val_total
         }
         key = str(BEST_BY).lower()
-        chosen = metric_map.get(key, rmse_overall)
+        chosen = metric_map.get(key, val_total)
 
         def _is_better(new, old):
             if not np.isfinite(new): return False
@@ -1180,28 +1032,23 @@ def train_multitask_contrast(ds_train):
             "lora_r": LORA_R,
             "lora_alpha": LORA_ALPHA,
             "lora_dropout": LORA_DROPOUT,
-            "val_loss": val_loss,
-            "val_rmse_overall": rmse_overall,
-            "val_rmse_calm": rmse_calm,
-            "val_rmse_storm": rmse_storm,
+            "val_total": val_total,
+            "val_ssl": val_ssl,
+            "val_forecast": val_fore,
+            "val_cls": val_cls,
+            "z2n": z2n,
+            "n2z": n2z,
             "best_by": key,
             "epoch": epoch,
-            # ------- keep classifier head for finetuning gating -------
+            # save classifier head so finetuning can gate with it
             "cls_head_state_dict": model.cls_head.state_dict(),
         }
 
-        if key == "loss":
-            if _is_better(chosen, best["loss"]):
-                best["loss"] = chosen
-                best["epoch"] = epoch
-                torch.save(ckpt_payload, SAVE_PATH)
-                print(f"[Pretrain Val] New best (loss={val_loss:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
-        else:
-            if _is_better(chosen, best[key]):
-                best[key] = chosen
-                best["epoch"] = epoch
-                torch.save(ckpt_payload, SAVE_PATH)
-                print(f"[Pretrain Val] New best ({key} RMSE={chosen:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
+        if _is_better(chosen, best["loss"]):
+            best["loss"] = chosen
+            best["epoch"] = epoch
+            torch.save(ckpt_payload, SAVE_PATH)
+            print(f"[Pretrain Val] New best (loss={val_total:.6f}) at epoch {epoch}. Saved: {SAVE_PATH}")
 
         # Optional: save LoRA adapter/backbone
         try:
