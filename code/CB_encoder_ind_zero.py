@@ -895,6 +895,9 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
 
     if FREEZE_ENCODER:
         opt = torch.optim.Adam(other_params, lr=LR, weight_decay=WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=LR, epochs=EPOCHS, steps_per_epoch=len(dl)
+        )
     else:
         opt = torch.optim.Adam(
             [
@@ -902,6 +905,9 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
                 {"params": other_params, "lr": LR}
             ],
             weight_decay=WEIGHT_DECAY
+        )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=[ENCODER_LR, LR], epochs=EPOCHS, steps_per_epoch=len(dl)
         )
 
     loss_fn = nn.MSELoss()
@@ -924,11 +930,14 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
+            scheduler.step()
             epoch_loss += loss.item() * xb.size(0)
 
         epoch_loss /= len(dl.dataset)
         elapsed = time.time() - start_time
-        print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s")
+        lrs = scheduler.get_last_lr()
+        lr_str = ", ".join(f"{lr:.2e}" for lr in lrs)
+        print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s | LR: {lr_str}")
         if eval_callback is not None:
             eval_callback(model, epoch + 1)
 
