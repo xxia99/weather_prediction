@@ -89,7 +89,7 @@ EVENT_METHOD   = "mean"   # or "max" for day score
 STORM_TOP_Q    = 0.80     # top 20% days considered "stormy"
 CALM_BOTTOM_Q  = 0.50     # bottom 50% pool for calm sampling
 CALM_N         = 10       # sample 10 calm days
-BEST_BY        = "overall"  # "overall" | "calm" | "storm" | "loss"
+BEST_BY        = "loss"  # "overall" | "calm" | "storm" | "loss"
 
 # ---------- TSMixup ----------
 TSMIXUP_PROB       = 0#0.5
@@ -707,6 +707,51 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     })
     return _per_county_rmse_mean(df_truth_wide, df_zero_long)
 
+# ------- NEW: zero/nonzero ratio helper -------
+def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame, thr: float = 0.0):
+    """
+    Computes:
+      Zero→Nonzero = P(pred>thr | truth==0)  (false positive rate among true zeros)
+      Nonzero→Zero = P(pred==0 | truth>thr)  (false negative rate among true nonzeros)
+    Both computed on the intersection (merge) of timestamps/locations.
+    Also returns the same ratios for an all-zero baseline.
+    """
+    if df_truth_wide.empty or df_pred_long.empty:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+
+    # melt truth to long
+    locs = [c for c in df_truth_wide.columns if c != "timestamp"]
+    truth_long = df_truth_wide.melt(id_vars="timestamp", value_vars=locs,
+                                    var_name="location", value_name="true").copy()
+    # ensure dtypes
+    truth_long["timestamp"] = pd.to_datetime(truth_long["timestamp"])
+    df_pred = df_pred_long.copy()
+    df_pred["timestamp"] = pd.to_datetime(df_pred["timestamp"])
+
+    merged = truth_long.merge(df_pred, on=["timestamp", "location"], how="inner")
+    if merged.empty:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+
+    true = merged["true"].astype(float).values
+    pred = merged["pred"].astype(float).values
+
+    nz_true = true > thr
+    nz_pred = pred > thr
+
+    n_true_zero = int((~nz_true).sum())
+    n_true_nonzero = int(nz_true.sum())
+
+    # current model ratios
+    z2n = float(((~nz_true) & nz_pred).sum() / n_true_zero) if n_true_zero > 0 else float("nan")
+    n2z = float((nz_true & (~nz_pred)).sum() / n_true_nonzero) if n_true_nonzero > 0 else float("nan")
+
+    # all-zero baseline: pred==0 for all -> nz_pred_baseline = False
+    nz_pred0 = np.zeros_like(nz_pred, dtype=bool)
+    z2n0 = float(((~nz_true) & nz_pred0).sum() / n_true_zero) if n_true_zero > 0 else float("nan")   # -> 0.0
+    n2z0 = float((nz_true & (~nz_pred0)).sum() / n_true_nonzero) if n_true_nonzero > 0 else float("nan")  # -> 1.0 when any nonzero exists
+
+    return z2n, n2z, z2n0, n2z0
+
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
     days, _, _ = _compute_day_indices(ts)
@@ -1077,14 +1122,18 @@ def train_multitask_contrast(ds_train):
                     calm_n=CALM_N,
                     seed=42
                 )
+                # ------- NEW: zero/nonzero ratios on validation -------
+                z2n, n2z, z2n0, n2z0 = _zero_nonzero_ratios(df_truth_val, df_pred_val, thr=0.0)
             else:
                 rmse_overall = rmse_calm = rmse_storm = float("nan")
                 zero_overall = zero_calm = zero_storm = float("nan")
                 n_calm = n_storm = 0
+                z2n = n2z = z2n0 = n2z0 = float("nan")
         else:
             rmse_overall = rmse_calm = rmse_storm = float("nan")
             zero_overall = zero_calm = zero_storm = float("nan")
             n_calm = n_storm = 0
+            z2n = n2z = z2n0 = n2z0 = float("nan")
 
         # Reporting
         if np.isfinite(rmse_overall):
@@ -1101,6 +1150,12 @@ def train_multitask_contrast(ds_train):
             print(f"[EventEval] Storm-heavy ({n_storm} days): RMSE={rmse_storm:.4f} (all-zero={zero_storm:.4f})")
         else:
             print(f"[EventEval] Storm-heavy: RMSE=nan (all-zero=nan)")
+
+        # ------- NEW: print zero/nonzero ratio metrics -------
+        if np.isfinite(z2n) or np.isfinite(n2z):
+            print(f"[Pretrain Val] Zero→Nonzero={z2n:.4f} (all-zero={z2n0:.4f}) | Nonzero→Zero={n2z:.4f} (all-zero={n2z0:.4f})")
+        else:
+            print(f"[Pretrain Val] Zero→Nonzero=nan (all-zero=nan) | Nonzero→Zero=nan (all-zero=nan)")
 
         # ---------- Save best by BEST_BY ----------
         metric_map = {
@@ -1131,7 +1186,7 @@ def train_multitask_contrast(ds_train):
             "val_rmse_storm": rmse_storm,
             "best_by": key,
             "epoch": epoch,
-            # ------- NEW: save classifier head so finetuning can gate with it -------
+            # ------- keep classifier head for finetuning gating -------
             "cls_head_state_dict": model.cls_head.state_dict(),
         }
 
