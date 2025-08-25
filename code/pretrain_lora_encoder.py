@@ -835,9 +835,6 @@ def train_multitask_contrast(ds_train):
 
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
                            lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=LR, epochs=EPOCHS, steps_per_epoch=len(loader)
-    )
 
     # BCE with class imbalance handling
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([CLS_POS_WEIGHT], device=DEVICE))
@@ -986,14 +983,13 @@ def train_multitask_contrast(ds_train):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             opt.step()
-            scheduler.step()
 
             epoch_loss += loss.item() * Bsz
             seen_samples += Bsz
 
         epoch_loss /= max(1, seen_samples)
         took = time.time() - start
-        lr_str = ", ".join(f"{lr:.2e}" for lr in scheduler.get_last_lr())
+        lr_str = ", ".join(f"{pg['lr']:.2e}" for pg in opt.param_groups)
         print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
               f"ssl(tr)={loss_ssl.item():.6f} fore(tr)={loss_fore.item():.6f} "
               f"cls(tr)={loss_cls.item():.6f} "
