@@ -854,27 +854,47 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-            # Save predictions, ground truths, and plot
-            pred_path = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_{label}.csv")
-            truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_{label}.csv")
-            df_pred_val.to_csv(pred_path, index=False)
-            df_truth_val.to_csv(truth_path, index=False)
+            # Save predictions, ground truths, and per-day plots
+            ts_map = pd.DataFrame({
+                "timestamp": pd.to_datetime(aux["timestamps"]),
+                "day": aux["days"]
+            })
+            df_pred_day = df_pred_val.merge(ts_map, on="timestamp", how="left")
+            df_truth_day = df_truth_val.merge(ts_map, on="timestamp", how="left")
 
-            truth_mean = df_truth_val.set_index("timestamp").mean(axis=1).reset_index(name="truth")
-            pred_mean = df_pred_val.groupby("timestamp")["pred"].mean().reset_index()
-            merged = pd.merge(truth_mean, pred_mean, on="timestamp", how="inner").sort_values("timestamp")
-            plt.figure()
-            plt.plot(merged["timestamp"], merged["truth"], label="Truth")
-            plt.plot(merged["timestamp"], merged["pred"], label="Prediction")
-            plt.legend()
-            plt.xlabel("timestamp")
-            plt.ylabel("outage")
-            plt.title(f"Validation Prediction vs Truth ({label}) epoch {epoch}")
-            fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
-            plt.savefig(fig_path)
-            plt.close()
-            print(f"[Val {label}] Saved prediction/truth data: {pred_path}, {truth_path}")
-            print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
+            unique_days = sorted(df_pred_day["day"].dropna().unique())
+            for d in unique_days:
+                pred_d = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
+                truth_d = df_truth_day[df_truth_day["day"] == d].drop(columns="day")
+                pred_path = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
+                truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_day{int(d)}_{label}.csv")
+                pred_d.to_csv(pred_path, index=False)
+                truth_d.to_csv(truth_path, index=False)
+                print(f"[Val {label}] Saved day {int(d)} prediction/truth data: {pred_path}, {truth_path}")
+
+            if unique_days:
+                fig, axes = plt.subplots(len(unique_days), 1, figsize=(8, 3 * len(unique_days)), sharex=False)
+                if len(unique_days) == 1:
+                    axes = [axes]
+                for ax, d in zip(axes, unique_days):
+                    truth_d = df_truth_day[df_truth_day["day"] == d].set_index("timestamp").drop(columns="day")
+                    truth_mean = truth_d.mean(axis=1).reset_index(name="truth")
+                    pred_mean = (
+                        df_pred_day[df_pred_day["day"] == d]
+                        .groupby("timestamp")["pred"].mean().reset_index()
+                    )
+                    merged = pd.merge(truth_mean, pred_mean, on="timestamp", how="inner").sort_values("timestamp")
+                    ax.plot(merged["timestamp"], merged["truth"], label="Truth")
+                    ax.plot(merged["timestamp"], merged["pred"], label="Prediction")
+                    ax.set_title(f"Day {int(d)}")
+                    ax.set_xlabel("timestamp")
+                    ax.set_ylabel("outage")
+                    ax.legend()
+                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
+                fig.tight_layout()
+                fig.savefig(fig_path)
+                plt.close(fig)
+                print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
 
         # ---- Test set evaluation at each validation step ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
