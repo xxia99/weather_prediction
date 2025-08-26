@@ -989,10 +989,11 @@ def train_multitask_contrast(ds_train):
 
         epoch_loss /= max(1, seen_samples)
         took = time.time() - start
+        lr_str = ", ".join(f"{pg['lr']:.2e}" for pg in opt.param_groups)
         print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
               f"ssl(tr)={loss_ssl.item():.6f} fore(tr)={loss_fore.item():.6f} "
               f"cls(tr)={loss_cls.item():.6f} "
-              f"time={took:.2f}s | batches={len(loader)} samples={seen_samples}")
+              f"time={took:.2f}s | batches={len(loader)} samples={seen_samples} | LR={lr_str}")
 
         # ---------- Validation: per-loss + classifier ratios ----------
         (val_total, val_ssl, val_fore, val_cls,
