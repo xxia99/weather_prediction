@@ -74,6 +74,11 @@ W_OUTAGE_FORECAST = 0#1.0
 W_CLS             = 1.0        # weight for classification loss
 CLS_POS_WEIGHT    = 6.0        # BCE pos_weight to fight imbalance (tune)
 CLS_DROPOUT       = 0.1
+W_MAG             = 1.0        # weight for outage magnitude loss
+W_SPIKE           = 0.1        # weight for spike quantile loss
+QUANTILE_TAU      = 0.9        # high quantile for residual spikes
+NOISE_AUG_PROB    = 0.3        # probability of noise perturbation
+NOISE_AUG_STD     = 0.01       # std of Gaussian noise for augmentation
 
 # ---------- Mixture-of-Experts ----------
 MOE_EXPERTS = 4
@@ -104,7 +109,7 @@ TSMIXUP_LEN_FRAC   = (0.5, 1.0)
 TSMIXUP_EPS        = 1e-6
 
 # ---------- Storm-weighted sampling ----------
-STORM_SAMPLING         = False #True
+STORM_SAMPLING         = True
 STORM_POW              = 0.75
 STORM_MIN_WEIGHT       = 0.1
 
@@ -435,7 +440,7 @@ class MultiTaskCBEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(D_OUT, D_OUT)
         )
-        # binary classifier for outages (>0) over the next H steps (weather-only context)
+        # binary classifier and magnitude heads for outages
         self.cls_head = MoE(
             D_OUT,
             horizon,
@@ -443,6 +448,14 @@ class MultiTaskCBEncoder(nn.Module):
             hidden_dim=2 * D_OUT,
             dropout=CLS_DROPOUT,
         )
+        self.rate_head = MoE(
+            D_OUT,
+            horizon,
+            num_experts=MOE_EXPERTS,
+            hidden_dim=2 * D_OUT,
+            dropout=CLS_DROPOUT,
+        )
+        self.spike_head = nn.Linear(D_OUT, horizon)
 
     def encode_steps(self, x):
         return self.encoder(x)
@@ -477,6 +490,22 @@ class MultiTaskCBEncoder(nn.Module):
         logits = self.cls_head(pooled)    # (B,N,H)
         return logits.permute(0, 2, 1)    # (B,H,N)
 
+    def outage_rate_from_weather(self, x):
+        x_wo = x.clone()
+        x_wo[..., 0] = 0.0
+        h = self.encoder(x_wo)
+        pooled = h.mean(dim=1)
+        rate = F.softplus(self.rate_head(pooled))
+        return rate.permute(0, 2, 1)
+
+    def outage_spike_from_weather(self, x):
+        x_wo = x.clone()
+        x_wo[..., 0] = 0.0
+        h = self.encoder(x_wo)
+        pooled = h.mean(dim=1)
+        spike = self.spike_head(pooled)
+        return F.relu(spike).permute(0, 2, 1)
+
 # =========================
 # Losses
 # =========================
@@ -496,6 +525,10 @@ def forecast_loss(pred, target):
     target: (B,H,N,109)
     """
     return torch.mean((pred - target) ** 2)
+
+def quantile_loss(pred, target, tau):
+    diff = target - pred
+    return torch.mean(torch.maximum(tau * diff, (tau - 1) * diff))
 
 def info_nce_loss(z1, z2, tau=0.2):
     B = z1.size(0)
@@ -849,10 +882,11 @@ def train_multitask_contrast(ds_train):
 
     def compute_val_metrics():
         if val_loader is None:
-            return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+            return (float("nan"), float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
         model.eval()
         tot, cnt = 0.0, 0
-        ssl_sum, fore_sum, cls_sum = 0.0, 0.0, 0.0
+        ssl_sum, fore_sum, cls_sum, mag_sum, spike_sum = 0.0, 0.0, 0.0, 0.0, 0.0
         # for ratios
         logits_all = []
         ycls_all   = []
@@ -876,15 +910,26 @@ def train_multitask_contrast(ds_train):
                 l_ssl  = masked_recon_loss(recon, xb_weather, mask_ssl)
                 l_fore = forecast_loss(fut, yb_weather)
 
-                # classification (weather-only context)
-                y_future_out = yb[..., 0].squeeze(-1)          # (B,H)
-                y_cls = (y_future_out > 0).float()             # (B,H)
-                logits = model.outage_logits_from_weather(xb).squeeze(-1)  # (B,H)
+                y_future_out = yb[..., 0].squeeze(-1)
+                y_cls = (y_future_out > 0).float()
+                logits = model.outage_logits_from_weather(xb).squeeze(-1)
+                rate = model.outage_rate_from_weather(xb).squeeze(-1)
+                spike = model.outage_spike_from_weather(xb).squeeze(-1)
                 l_cls = bce(logits, y_cls)
+                lam = torch.sigmoid(logits) * (rate + spike)
+                l_mag = F.poisson_nll_loss(lam + 1e-8, y_future_out, log_input=False)
+                pos_mask = y_cls.bool()
+                if pos_mask.any():
+                    residual = F.relu(y_future_out[pos_mask] - rate[pos_mask])
+                    l_spike = quantile_loss(spike[pos_mask], residual, QUANTILE_TAU)
+                else:
+                    l_spike = torch.tensor(0.0, device=xb.device)
 
                 ssl_sum  += l_ssl.item()  * Bsz
                 fore_sum += l_fore.item() * Bsz
                 cls_sum  += l_cls.item()  * Bsz
+                mag_sum  += l_mag.item()  * Bsz
+                spike_sum += l_spike.item() * Bsz
 
                 if USE_CONTRASTIVE:
                     x1 = make_view(xb, VIEW_MASK_MODE, VIEW_MASK_RATIO, VIEW_SPAN_LEN,
@@ -898,7 +943,8 @@ def train_multitask_contrast(ds_train):
                     l_contrast = torch.tensor(0.0, device=xb.device)
 
                 l_total = (W_SSL * l_ssl + W_FORECAST * l_fore +
-                           W_CONTRAST * l_contrast + W_CLS * l_cls)
+                           W_CONTRAST * l_contrast + W_CLS * l_cls +
+                           W_MAG * l_mag + W_SPIKE * l_spike)
 
                 tot  += l_total.item() * Bsz
                 cnt  += Bsz
@@ -919,6 +965,8 @@ def train_multitask_contrast(ds_train):
                 ssl_sum / max(1, cnt),
                 fore_sum / max(1, cnt),
                 cls_sum / max(1, cnt),
+                mag_sum / max(1, cnt),
+                spike_sum / max(1, cnt),
                 z2n, n2z, z2n0, n2z0)
 
     for epoch in range(1, EPOCHS + 1):
@@ -942,6 +990,9 @@ def train_multitask_contrast(ds_train):
                 eps=TSMIXUP_EPS
             )
 
+            if NOISE_AUG_PROB > 0.0 and torch.rand(1).item() < NOISE_AUG_PROB:
+                xb = xb + NOISE_AUG_STD * torch.randn_like(xb)
+
             Bsz, T, _, _ = xb.shape
             mask_ssl = make_temporal_mask(
                 Bsz, T, mode=MASK_MODE, ratio=MASK_RATIO, span_len=SPAN_LEN, device=xb.device
@@ -958,11 +1009,21 @@ def train_multitask_contrast(ds_train):
             loss_ssl  = masked_recon_loss(recon, xb_weather, mask_ssl)
             loss_fore = forecast_loss(fut, yb_weather)
 
-            # classification loss (weather-only context)
-            y_future_out = yb[..., 0].squeeze(-1)               # (B,H)
-            y_cls = (y_future_out > 0).float()                  # (B,H)
-            logits = model.outage_logits_from_weather(xb).squeeze(-1)  # (B,H)
+            # classification + magnitude
+            y_future_out = yb[..., 0].squeeze(-1)
+            y_cls = (y_future_out > 0).float()
+            logits = model.outage_logits_from_weather(xb).squeeze(-1)
+            rate = model.outage_rate_from_weather(xb).squeeze(-1)
+            spike = model.outage_spike_from_weather(xb).squeeze(-1)
             loss_cls = bce(logits, y_cls)
+            lam = torch.sigmoid(logits) * (rate + spike)
+            loss_mag = F.poisson_nll_loss(lam + 1e-8, y_future_out, log_input=False)
+            pos_mask = y_cls.bool()
+            if pos_mask.any():
+                residual = F.relu(y_future_out[pos_mask] - rate[pos_mask])
+                loss_spike = quantile_loss(spike[pos_mask], residual, QUANTILE_TAU)
+            else:
+                loss_spike = torch.tensor(0.0, device=xb.device)
 
             if USE_CONTRASTIVE:
                 x1 = make_view(
@@ -984,6 +1045,8 @@ def train_multitask_contrast(ds_train):
                 + W_FORECAST * loss_fore
                 + W_CONTRAST * loss_contrast
                 + W_CLS * loss_cls
+                + W_MAG * loss_mag
+                + W_SPIKE * loss_spike
             )
 
             loss.backward()
@@ -998,18 +1061,19 @@ def train_multitask_contrast(ds_train):
         lr_str = ", ".join(f"{pg['lr']:.2e}" for pg in opt.param_groups)
         print(f"[Pretrain] Epoch {epoch:02d} total={epoch_loss:.6f} "
               f"ssl(tr)={loss_ssl.item():.6f} fore(tr)={loss_fore.item():.6f} "
-              f"cls(tr)={loss_cls.item():.6f} "
+              f"cls(tr)={loss_cls.item():.6f} mag(tr)={loss_mag.item():.6f} spike(tr)={loss_spike.item():.6f} "
               f"time={took:.2f}s | batches={len(loader)} samples={seen_samples} | LR={lr_str}")
 
         # ---------- Validation: per-loss + classifier ratios ----------
-        (val_total, val_ssl, val_fore, val_cls,
+        (val_total, val_ssl, val_fore, val_cls, val_mag, val_spike,
          z2n, n2z, z2n0, n2z0) = compute_val_metrics()
 
         if np.isfinite(val_total):
             print(f"[Pretrain Val] Epoch {epoch:02d}: "
-                  f"ValTotal={val_total:.6f} | SSL={val_ssl:.6f} | Forecast={val_fore:.6f} | Cls={val_cls:.6f}")
+                  f"ValTotal={val_total:.6f} | SSL={val_ssl:.6f} | Forecast={val_fore:.6f} | "
+                  f"Cls={val_cls:.6f} | Mag={val_mag:.6f} | Spike={val_spike:.6f}")
         else:
-            print(f"[Pretrain Val] Epoch {epoch:02d}: ValTotal=nan | SSL=nan | Forecast=nan | Cls=nan")
+            print(f"[Pretrain Val] Epoch {epoch:02d}: ValTotal=nan | SSL=nan | Forecast=nan | Cls=nan | Mag=nan | Spike=nan")
 
         # ------- classification zero/nonzero ratios (validation) -------
         if np.isfinite(z2n) or np.isfinite(n2z):
@@ -1043,12 +1107,16 @@ def train_multitask_contrast(ds_train):
             "val_ssl": val_ssl,
             "val_forecast": val_fore,
             "val_cls": val_cls,
+            "val_mag": val_mag,
+            "val_spike": val_spike,
             "z2n": z2n,
             "n2z": n2z,
             "best_by": key,
             "epoch": epoch,
             # save classifier head so finetuning can gate with it
             "cls_head_state_dict": model.cls_head.state_dict(),
+            "rate_head_state_dict": model.rate_head.state_dict(),
+            "spike_head_state_dict": model.spike_head.state_dict(),
         }
 
         if _is_better(chosen, best["loss"]):
