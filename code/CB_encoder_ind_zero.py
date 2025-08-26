@@ -456,10 +456,10 @@ class STGNNForecaster(nn.Module):
         self.spike_head = nn.Linear(STEM_D_MODEL, horizon)
 
     def forward(self, x, return_components: bool = False):
-        # x: (B, T, N, F)
-        B, T, N, F = x.shape
-        assert N == self.num_nodes and F == self.in_channels, \
-            f"StemGNN input shape mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
+        # x: (B, T, N, C)
+        B, T, N, C = x.shape
+        assert N == self.num_nodes and C == self.in_channels, \
+            f"StemGNN input shape mismatch: got N={N},F={C}, expected N={self.num_nodes},F={self.in_channels}"
 
         h = self.patch(x)
         h, aux_loss = self.bridge_moe(h, return_aux=True)
