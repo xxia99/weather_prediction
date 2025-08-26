@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
-# MoE layer
-from moe import MoE, Top1MoE
+# Mixture-of-experts layer
+from moe import MoE
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
@@ -51,7 +51,6 @@ STEM_DROPOUT  = 0.03   # lighter dropout
 
 # === Mixture-of-Experts ===
 MOE_EXPERTS   = 4
-MOE_AUX_WEIGHT = 1e-2
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
@@ -422,12 +421,6 @@ class STGNNForecaster(nn.Module):
             print("[Encoder] Frozen (no fine-tuning).")
 
         enc_out_dim = getattr(self.patch, "d_model", PATCH_D_MODEL)
-        self.bridge_moe = Top1MoE(
-            enc_out_dim,
-            num_experts=2,
-            hidden_dim=2 * enc_out_dim,
-            dropout=STEM_DROPOUT,
-        )
         blocks = []
         d_in = enc_out_dim
         for _ in range(STEM_NBLOCKS):
@@ -462,7 +455,6 @@ class STGNNForecaster(nn.Module):
             f"StemGNN input shape mismatch: got N={N},F={C}, expected N={self.num_nodes},F={self.in_channels}"
 
         h = self.patch(x)
-        h, aux_loss = self.bridge_moe(h, return_aux=True)
         for blk in self.blocks:
             h = blk(h)
         last = h[:, -1]  # (B, N, D)
@@ -472,7 +464,7 @@ class STGNNForecaster(nn.Module):
         prob = torch.sigmoid(logits)
         y = prob * (rate + F.relu(spike))
         if return_components:
-            return y, aux_loss, logits, rate, spike
+            return y, logits, rate, spike
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------
@@ -1086,7 +1078,7 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
                 xb = xb + NOISE_AUG_STD * torch.randn_like(xb)
 
             opt.zero_grad()
-            pred, aux_loss, logits, rate, spike = model(xb, return_components=True)
+            pred, logits, rate, spike = model(xb, return_components=True)
             cls_target = (yb > OUTAGE_THRESHOLD).float()
             loss_cls = bce(logits, cls_target)
             lam = torch.sigmoid(logits) * (rate + F.relu(spike))
@@ -1097,7 +1089,7 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
                 loss_q = quantile_loss(F.relu(spike[pos_mask]), residual, QUANTILE_TAU)
             else:
                 loss_q = torch.tensor(0.0, device=xb.device)
-            loss = loss_mag + CLS_LOSS_WEIGHT * loss_cls + QUANTILE_LOSS_WEIGHT * loss_q + MOE_AUX_WEIGHT * aux_loss
+            loss = loss_mag + CLS_LOSS_WEIGHT * loss_cls + QUANTILE_LOSS_WEIGHT * loss_q
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
