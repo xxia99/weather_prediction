@@ -529,7 +529,14 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w_raw = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
-    w = augment_weather_features(w_raw)
+    if USE_CB_ENCODER:
+        # The CB encoder is pretrained on the original 109 weather features;
+        # avoid augmenting to keep the channel dimension at 110 (=1 + 109).
+        w = w_raw
+    else:
+        # For other encoders we can enrich inputs with gradients, rolling means,
+        # and a storm indicator to provide additional context.
+        w = augment_weather_features(w_raw)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
     T, N, F_tot = w.shape
