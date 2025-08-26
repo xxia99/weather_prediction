@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, RandomSampler
+from moe import MoE
 
 # =========================
 # Config
@@ -73,6 +74,9 @@ W_OUTAGE_FORECAST = 0#1.0
 W_CLS             = 1.0        # weight for classification loss
 CLS_POS_WEIGHT    = 6.0        # BCE pos_weight to fight imbalance (tune)
 CLS_DROPOUT       = 0.1
+
+# ---------- Mixture-of-Experts ----------
+MOE_EXPERTS = 4
 
 # ---------- CB + PEFT (LoRA) ----------
 CB_MODEL_NAME   = "/home2/caojia/weather_prediction/code/chronos-bolt-small"
@@ -419,11 +423,12 @@ class MultiTaskCBEncoder(nn.Module):
 
         # weather-only heads
         self.recon_head = nn.Linear(D_OUT, self.weather_dim)  # 109
-        self.forecast_head = nn.Sequential(
-            nn.Linear(D_OUT, 2 * D_OUT),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(2 * D_OUT, horizon * self.weather_dim)  # H * 109
+        self.forecast_head = MoE(
+            D_OUT,
+            horizon * self.weather_dim,
+            num_experts=MOE_EXPERTS,
+            hidden_dim=2 * D_OUT,
+            dropout=0.2,
         )
         self.proj_head = nn.Sequential(
             nn.Linear(D_OUT, D_OUT),
@@ -431,11 +436,12 @@ class MultiTaskCBEncoder(nn.Module):
             nn.Linear(D_OUT, D_OUT)
         )
         # binary classifier for outages (>0) over the next H steps (weather-only context)
-        self.cls_head = nn.Sequential(
-            nn.Linear(D_OUT, 2 * D_OUT),
-            nn.GELU(),
-            nn.Dropout(CLS_DROPOUT),
-            nn.Linear(2 * D_OUT, horizon)  # logits per future step
+        self.cls_head = MoE(
+            D_OUT,
+            horizon,
+            num_experts=MOE_EXPERTS,
+            hidden_dim=2 * D_OUT,
+            dropout=CLS_DROPOUT,
         )
 
     def encode_steps(self, x):

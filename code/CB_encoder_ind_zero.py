@@ -10,6 +10,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+# MoE layer
+from moe import MoE
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
@@ -45,6 +47,9 @@ STEM_K_ORDER  = 2      # enable 2-hop spatial diffusion
 STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
 STEM_DROPOUT  = 0.03   # lighter dropout
+
+# === Mixture-of-Experts ===
+MOE_EXPERTS   = 4
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
@@ -418,7 +423,13 @@ class STGNNForecaster(nn.Module):
             )
             d_in = STEM_D_MODEL
         self.blocks = nn.ModuleList(blocks)
-        self.readout = nn.Linear(STEM_D_MODEL, horizon)
+        self.readout = MoE(
+            STEM_D_MODEL,
+            horizon,
+            num_experts=MOE_EXPERTS,
+            hidden_dim=2 * STEM_D_MODEL,
+            dropout=STEM_DROPOUT,
+        )
 
     def forward(self, x):
         # x: (B, T, N, F)
