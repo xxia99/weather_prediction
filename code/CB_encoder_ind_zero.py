@@ -10,12 +10,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+# MoE layer
+from moe import MoE
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-# OUT_DIR   = "results_seq_mse_pre-CB/lora_new"
-OUT_DIR   = "results_seq_mse_pre-patch_daily/"
+# OUT_DIR   = "results_seq_mse_pre-CB_moe/lora_new"
+OUT_DIR   = "results_seq_mse_pre-patch_moe_daily/"
 # OUT_DIR   = "results_seq_mse_non-pre/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -25,7 +27,7 @@ BATCH_SIZE    = 64        # larger batch for more stable gradients
 EPOCHS        = 40        # train for more epochs
 LR            = 5e-4      # higher LR for faster convergence
 WEIGHT_DECAY  = 5e-5      # lighter L2 regularization
-DEVICE        = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE        = "cuda:2" if torch.cuda.is_available() else "cpu"
 
 # === temporal dropout probability (drop whole timesteps during training) ===
 # disable aggressive temporal dropout; rely on standard dropout instead
@@ -47,6 +49,9 @@ STEM_NBLOCKS  = 2      # stacked spatio-temporal blocks
 STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
 STEM_DROPOUT  = 0.03   # lighter dropout
 
+# === Mixture-of-Experts ===
+MOE_EXPERTS   = 4
+
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
 ENCODER_LR              = 3e-4  # allow modest encoder fine-tuning
@@ -54,6 +59,7 @@ FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
 USE_CB_ENCODER          = False
+# USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
 CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
@@ -419,7 +425,13 @@ class STGNNForecaster(nn.Module):
             )
             d_in = STEM_D_MODEL
         self.blocks = nn.ModuleList(blocks)
-        self.readout = nn.Linear(STEM_D_MODEL, horizon)
+        self.readout = MoE(
+            STEM_D_MODEL,
+            horizon,
+            num_experts=MOE_EXPERTS,
+            hidden_dim=2 * STEM_D_MODEL,
+            dropout=STEM_DROPOUT,
+        )
 
     def forward(self, x):
         # x: (B, T, N, F)
