@@ -113,6 +113,11 @@ STORM_SAMPLING         = True
 STORM_POW              = 0.75
 STORM_MIN_WEIGHT       = 0.1
 
+# --- Calm oversampling & smoothing ---
+CALM_OVERSAMPLE = 2.0
+OUTAGE_THRESHOLD = 0.5
+SMOOTH_WINDOW = 3
+
 # ---------- Steps-per-epoch expansion ----------
 EPOCH_EXPANSION = 1 #2.0
 
@@ -821,15 +826,20 @@ def train_multitask_contrast(ds_train):
     dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
                             torch.tensor(Y_fut_tr, dtype=torch.float32))
 
-    # Storm-aware sample weights (kept optional)
+    sample_weights = np.ones(len(dataset), dtype=float)
     if STORM_SAMPLING and len(dataset) > 0:
         with torch.no_grad():
             y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)  # (nS, H, 1)
             s = y_h.mean(dim=(1, 2)).clamp_min(0) + 1e-6
             w = (s ** STORM_POW)
             w = (w / (w.mean() + 1e-6)).clamp_min(STORM_MIN_WEIGHT)
-            sample_weights = w.numpy()
-    else:
+            sample_weights *= w.numpy()
+    if CALM_OVERSAMPLE > 1.0 and len(dataset) > 0:
+        with torch.no_grad():
+            y_h = torch.tensor(Y_fut_tr[..., 0], dtype=torch.float32)
+            calm_mask = (y_h.mean(dim=(1, 2)) <= OUTAGE_THRESHOLD).numpy()
+            sample_weights *= np.where(calm_mask, CALM_OVERSAMPLE, 1.0)
+    if np.allclose(sample_weights, 1.0):
         sample_weights = None
 
     # Sampler
@@ -990,8 +1000,11 @@ def train_multitask_contrast(ds_train):
                 eps=TSMIXUP_EPS
             )
 
-            if NOISE_AUG_PROB > 0.0 and torch.rand(1).item() < NOISE_AUG_PROB:
-                xb = xb + NOISE_AUG_STD * torch.randn_like(xb)
+            if NOISE_AUG_PROB > 0.0:
+                neg_mask = (yb[..., 0].max(dim=1)[0].squeeze(-1) <= OUTAGE_THRESHOLD)
+                rand_mask = (torch.rand(neg_mask.shape[0], device=xb.device) < NOISE_AUG_PROB) & neg_mask
+                if rand_mask.any():
+                    xb[rand_mask] = xb[rand_mask] + NOISE_AUG_STD * torch.randn_like(xb[rand_mask])
 
             Bsz, T, _, _ = xb.shape
             mask_ssl = make_temporal_mask(
@@ -1016,13 +1029,14 @@ def train_multitask_contrast(ds_train):
             rate = model.outage_rate_from_weather(xb).squeeze(-1)
             spike = model.outage_spike_from_weather(xb).squeeze(-1)
             loss_cls = bce(logits, y_cls)
-            lam = torch.sigmoid(logits) * (rate + spike)
-            loss_mag = F.poisson_nll_loss(lam + 1e-8, y_future_out, log_input=False)
             pos_mask = y_cls.bool()
             if pos_mask.any():
+                lam = rate[pos_mask] + F.relu(spike[pos_mask])
+                loss_mag = F.poisson_nll_loss(lam + 1e-8, y_future_out[pos_mask], log_input=False)
                 residual = F.relu(y_future_out[pos_mask] - rate[pos_mask])
                 loss_spike = quantile_loss(spike[pos_mask], residual, QUANTILE_TAU)
             else:
+                loss_mag = torch.tensor(0.0, device=xb.device)
                 loss_spike = torch.tensor(0.0, device=xb.device)
 
             if USE_CONTRASTIVE:

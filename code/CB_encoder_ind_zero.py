@@ -82,11 +82,16 @@ ZERO_FP_WEIGHT = 2.0        # weight when truth is zero
 
 # --- Oversampling & augmentations ---
 STORMY_OVERSAMPLE = 3.0     # sampling weight for stormy windows
+CALM_OVERSAMPLE   = 2.0     # oversample calm/negative windows
 NOISE_AUG_PROB    = 0.3     # probability of applying noise perturbation
 NOISE_AUG_STD     = 0.01    # std of Gaussian noise
 CLS_LOSS_WEIGHT   = 0.1     # weight for outage occurrence classification
 QUANTILE_LOSS_WEIGHT = 0.05 # weight for spike quantile loss
 QUANTILE_TAU      = 0.9     # high quantile for spike residuals
+
+# --- Temporal smoothing & storm indicators ---
+SMOOTH_WINDOW     = 3       # moving-average window for output smoothing
+STORM_IND_THRESH  = 1.0     # gradient magnitude threshold for storm indicator
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -107,6 +112,20 @@ def zfit(arr):
 
 def zapply(arr, mu, sd):
     return (arr - mu) / sd
+
+def augment_weather_features(w):
+    """Add gradient, rolling mean, and storm indicator features."""
+    T, N, F = w.shape
+    # temporal gradient
+    grad = np.concatenate([np.zeros((1, N, F)), np.diff(w, axis=0)], axis=0)
+    # rolling mean with window=3
+    roll = np.zeros_like(w)
+    for t in range(T):
+        start = max(0, t - 2)
+        roll[t] = w[start:t+1].mean(axis=0)
+    # storm indicator: max abs gradient over features exceeds threshold
+    storm = (np.abs(grad).max(axis=2, keepdims=True) > STORM_IND_THRESH).astype(float)
+    return np.concatenate([w, grad, roll, storm], axis=2)
 
 def build_windows(X_loc, y_loc, seq_len, horizon):
     """
@@ -436,6 +455,8 @@ class STGNNForecaster(nn.Module):
             )
             d_in = STEM_D_MODEL
         self.blocks = nn.ModuleList(blocks)
+        # location embeddings added after encoder
+        self.loc_emb = nn.Embedding(num_nodes, enc_out_dim)
         # rate head for magnitude (Poisson intensity)
         self.rate_head = MoE(
             STEM_D_MODEL,
@@ -455,6 +476,8 @@ class STGNNForecaster(nn.Module):
             f"StemGNN input shape mismatch: got N={N},F={C}, expected N={self.num_nodes},F={self.in_channels}"
 
         h = self.patch(x)
+        emb = self.loc_emb(torch.arange(N, device=x.device))  # (N, D)
+        h = h + emb.unsqueeze(0).unsqueeze(0)
         for blk in self.blocks:
             h = blk(h)
         last = h[:, -1]  # (B, N, D)
@@ -462,9 +485,14 @@ class STGNNForecaster(nn.Module):
         logits = self.event_head(last)                   # (B, N, H)
         spike = self.spike_head(last)                    # (B, N, H)
         prob = torch.sigmoid(logits)
-        y = prob * (rate + F.relu(spike))
+        mag = rate + F.relu(spike)
+        y = prob * mag
+        if SMOOTH_WINDOW > 1:
+            y = y.view(B * N, 1, self.horizon)
+            y = F.avg_pool1d(y, kernel_size=SMOOTH_WINDOW, stride=1, padding=SMOOTH_WINDOW // 2)
+            y = y.view(B, N, self.horizon)
         if return_components:
-            return y, logits, rate, spike
+            return y, logits, prob, mag, rate, spike
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------
@@ -500,16 +528,17 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
       aux: dict with arrays used for validation (scaled series, timestamps, etc.)
     """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    w_raw = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    w = augment_weather_features(w_raw)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
-    T, N, F = w.shape
-    Din = 1 + F
+    T, N, F_tot = w.shape
+    Din = 1 + F_tot
 
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
 
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)       # (T, N)
-    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)    # (T, N, F)
+    w_sc = zapply(w.reshape(-1, F_tot), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F_tot)    # (T, N, F_tot)
     X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                               # (T, N, Din)
 
     N_total = T - SEQ_LEN - horizon + 1
@@ -528,7 +557,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
             X_sel = Xw[:N_train][:, :, None, :]
             Y_sel = Yw[:N_train][:, None, :]
             storm_mask = (Y_sel.reshape(Y_sel.shape[0], -1).max(axis=1) > OUTAGE_THRESHOLD)
-            W_sel = np.where(storm_mask, STORMY_OVERSAMPLE, 1.0)
+            W_sel = np.where(storm_mask, STORMY_OVERSAMPLE, CALM_OVERSAMPLE)
             X_list.append(X_sel)
             Y_list.append(Y_sel)
             W_list.append(W_sel)
@@ -1074,20 +1103,23 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
                     drop_mask = (torch.rand(xb.size(0), xb.size(1), 1, 1, device=xb.device) < TEMPORAL_DROP_PROB).float()
                     xb = xb * (1.0 - drop_mask)
 
-            if NOISE_AUG_PROB > 0.0 and torch.rand(1).item() < NOISE_AUG_PROB:
-                xb = xb + NOISE_AUG_STD * torch.randn_like(xb)
+            if NOISE_AUG_PROB > 0.0:
+                neg_mask = (yb.max(dim=2)[0] <= OUTAGE_THRESHOLD).squeeze(1)
+                rand_mask = (torch.rand(neg_mask.shape[0], device=xb.device) < NOISE_AUG_PROB) & neg_mask
+                if rand_mask.any():
+                    xb[rand_mask] = xb[rand_mask] + NOISE_AUG_STD * torch.randn_like(xb[rand_mask])
 
             opt.zero_grad()
-            pred, logits, rate, spike = model(xb, return_components=True)
+            pred, logits, prob, mag, rate, spike = model(xb, return_components=True)
             cls_target = (yb > OUTAGE_THRESHOLD).float()
             loss_cls = bce(logits, cls_target)
-            lam = torch.sigmoid(logits) * (rate + F.relu(spike))
-            loss_mag = F.poisson_nll_loss(lam + 1e-8, yb, log_input=False)
             pos_mask = cls_target.bool()
             if pos_mask.any():
+                loss_mag = F.poisson_nll_loss(mag[pos_mask] + 1e-8, yb[pos_mask], log_input=False)
                 residual = F.relu(yb[pos_mask] - rate[pos_mask])
                 loss_q = quantile_loss(F.relu(spike[pos_mask]), residual, QUANTILE_TAU)
             else:
+                loss_mag = torch.tensor(0.0, device=xb.device)
                 loss_q = torch.tensor(0.0, device=xb.device)
             loss = loss_mag + CLS_LOSS_WEIGHT * loss_cls + QUANTILE_LOSS_WEIGHT * loss_q
             loss.backward()
