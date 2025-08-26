@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 # MoE layer
-from moe import MoE
+from moe import MoE, Top1MoE
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
@@ -50,6 +50,7 @@ STEM_DROPOUT  = 0.03   # lighter dropout
 
 # === Mixture-of-Experts ===
 MOE_EXPERTS   = 4
+MOE_AUX_WEIGHT = 1e-2
 
 # === Pretrained encoder options (NEW) ===
 PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
@@ -412,6 +413,12 @@ class STGNNForecaster(nn.Module):
             print("[Encoder] Frozen (no fine-tuning).")
 
         enc_out_dim = getattr(self.patch, "d_model", PATCH_D_MODEL)
+        self.bridge_moe = Top1MoE(
+            enc_out_dim,
+            num_experts=2,
+            hidden_dim=2 * enc_out_dim,
+            dropout=STEM_DROPOUT,
+        )
         blocks = []
         d_in = enc_out_dim
         for _ in range(STEM_NBLOCKS):
@@ -435,19 +442,22 @@ class STGNNForecaster(nn.Module):
             dropout=STEM_DROPOUT,
         )
 
-    def forward(self, x):
+    def forward(self, x, return_aux: bool = False):
         # x: (B, T, N, F)
         B, T, N, F = x.shape
         assert N == self.num_nodes and F == self.in_channels, \
             f"StemGNN input shape mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
 
         h = self.patch(x)
+        h, aux_loss = self.bridge_moe(h, return_aux=True)
         for blk in self.blocks:
             h = blk(h)
         # pooled = h.mean(dim=1)      # (B, N, STEM_D_MODEL)
         # y = self.readout(pooled)    # (B, N, H)
         last = h[:, -1]  # (B, N, D) if h is (B, T, N, D)
         y = self.readout(last)
+        if return_aux:
+            return y, aux_loss
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------
@@ -1046,8 +1056,8 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
                     xb = xb * (1.0 - drop_mask)
 
             opt.zero_grad()
-            pred = model(xb)                       # (B, N, H)
-            loss = weighted_mse(pred, yb)
+            pred, aux_loss = model(xb, return_aux=True)  # (B, N, H)
+            loss = weighted_mse(pred, yb) + MOE_AUX_WEIGHT * aux_loss
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
