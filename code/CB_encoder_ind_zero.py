@@ -74,6 +74,10 @@ BEST_BY        = "overall"  # "overall" | "calm" | "storm"
 
 # ========= NEW for zero/nonzero diagnostics =========
 ZERO_EPS = 1e-8  # numerical tolerance for "zero" vs "nonzero"
+# additional thresholding to suppress false positives
+OUTAGE_THRESHOLD = 0.5      # base outage threshold
+AUTO_TUNE_THRESHOLD = True  # auto-search threshold on validation
+ZERO_FP_WEIGHT = 2.0        # weight when truth is zero
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -613,8 +617,9 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
 
 # ========= NEW: zero/nonzero diagnostic ratios =========
-# ========= REPLACE your _zero_nonzero_ratios with this version =========
-def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame, eps: float = ZERO_EPS):
+# allow configurable threshold instead of strict zero
+def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame,
+                         threshold: float = OUTAGE_THRESHOLD):
     """
     Returns (zero->nonzero_ratio, nonzero->zero_ratio)
       zero->nonzero: fraction of true==0 cells where pred>eps  (false positives)
@@ -669,18 +674,61 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     y_true = y_true[valid]
     y_pred = y_pred[valid]
 
-    true_zero = (np.abs(y_true) <= eps)
-    pred_zero = (np.abs(y_pred) <= eps)
+    truth_pos = y_true > threshold
+    pred_pos  = y_pred > threshold
 
-    # zero -> nonzero (false positives among truly zero)
-    denom_zero = np.sum(true_zero)
-    z_to_nz = np.sum(true_zero & (~pred_zero)) / denom_zero if denom_zero > 0 else float("nan")
+    denom_zero = np.sum(~truth_pos)
+    z_to_nz = np.sum((~truth_pos) & pred_pos) / denom_zero if denom_zero > 0 else float("nan")
 
-    # nonzero -> zero (false negatives among truly nonzero)
-    denom_nz = np.sum(~true_zero)
-    nz_to_z = np.sum((~true_zero) & pred_zero) / denom_nz if denom_nz > 0 else float("nan")
+    denom_nz = np.sum(truth_pos)
+    nz_to_z = np.sum(truth_pos & (~pred_pos)) / denom_nz if denom_nz > 0 else float("nan")
 
     return float(z_to_nz), float(nz_to_z)
+
+# compute precision/recall/F1 for a given threshold
+def _precision_recall(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame,
+                      threshold: float = OUTAGE_THRESHOLD):
+    if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
+        return float("nan"), float("nan"), float("nan")
+    df_t = df_truth_wide.copy()
+    df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce")
+    df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
+    tw = df_t.set_index("timestamp").sort_index()
+
+    df_p = df_pred_long.copy()
+    df_p["timestamp"] = pd.to_datetime(df_p["timestamp"], errors="coerce")
+    df_p["location"] = df_p["location"].astype(str)
+    df_p = df_p.dropna(subset=["timestamp", "location"]).groupby(["timestamp", "location"], as_index=False)["pred"].mean()
+    pw = df_p.pivot_table(index="timestamp", columns="location", values="pred", aggfunc="mean").sort_index()
+
+    common_ts = tw.index.intersection(pw.index)
+    if len(common_ts) == 0:
+        return float("nan"), float("nan"), float("nan")
+    tw = tw.loc[common_ts]
+    pw = pw.loc[common_ts]
+
+    locs = sorted(set(tw.columns).intersection(pw.columns))
+    if len(locs) == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    y_true = tw[locs].to_numpy()
+    y_pred = pw[locs].to_numpy()
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(valid):
+        return float("nan"), float("nan"), float("nan")
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+
+    truth_pos = y_true > threshold
+    pred_pos  = y_pred > threshold
+    tp = np.sum(truth_pos & pred_pos)
+    fp = np.sum(~truth_pos & pred_pos)
+    fn = np.sum(truth_pos & ~pred_pos)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    f1 = 2 * precision * recall / (precision + recall) if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0 else float("nan")
+    return float(precision), float(recall), float(f1)
 
 # ---- helpers for event selection (calm/storm) ----
 def _per_day_outage_score(ds_train, method: str = "mean"):
@@ -784,9 +832,25 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     """
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
+    tuned_threshold = OUTAGE_THRESHOLD
+
+    def _tune_threshold(df_truth, df_pred):
+        grid = np.linspace(0, 1.0, 21)
+        best_thr, best_f1 = OUTAGE_THRESHOLD, -1.0
+        for thr in grid:
+            _, _, f1 = _precision_recall(df_truth, df_pred, threshold=thr)
+            if np.isfinite(f1) and f1 > best_f1:
+                best_f1 = f1
+                best_thr = thr
+        return best_thr
 
     def _callback(model, epoch):
+        nonlocal tuned_threshold
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
+
+        if AUTO_TUNE_THRESHOLD:
+            tuned_threshold = _tune_threshold(df_truth_val, df_pred_val)
+            print(f"[Val {label}] Auto-tuned threshold={tuned_threshold:.3f}")
 
         # event-stratified metrics (with all-zero baselines)
         (rmse_overall, zero_overall,
@@ -802,7 +866,8 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         )
 
         # ---- NEW: zero/nonzero ratios (overall) ----
-        zpnz_model, nzpz_model = _zero_nonzero_ratios(df_truth_val, df_pred_val, eps=ZERO_EPS)
+        zpnz_model, nzpz_model = _zero_nonzero_ratios(df_truth_val, df_pred_val, threshold=tuned_threshold)
+        prec, rec, f1 = _precision_recall(df_truth_val, df_pred_val, threshold=tuned_threshold)
         # baseline: build zero preds matching truth timestamps/locations
         if not df_truth_val.empty:
             locs = [c for c in df_truth_val.columns if c != "timestamp"]
@@ -811,7 +876,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                 "location": np.tile(locs, len(df_truth_val)),
                 "pred": 0.0
             })
-            zpnz_zero, nzpz_zero = _zero_nonzero_ratios(df_truth_val, df_zero_long, eps=ZERO_EPS)
+            zpnz_zero, nzpz_zero = _zero_nonzero_ratios(df_truth_val, df_zero_long, threshold=tuned_threshold)
         else:
             zpnz_zero, nzpz_zero = float("nan"), float("nan")
 
@@ -826,6 +891,8 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
               f"(all-zero={zpnz_zero if np.isfinite(zpnz_zero) else float('nan'):.4f}) | "
               f"Nonzero→Zero ratio={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
               f"(all-zero={nzpz_zero if np.isfinite(nzpz_zero) else float('nan'):.4f})")
+        print(f"[Val {label}] Epoch {epoch}: Precision={prec if np.isfinite(prec) else float('nan'):.4f} "
+              f"Recall={rec if np.isfinite(rec) else float('nan'):.4f} F1={f1 if np.isfinite(f1) else float('nan'):.4f}")
 
         if np.isfinite(rmse_calm):
             print(f"[EventEval {label}] Calm-heavy ({n_calm} days): RMSE={rmse_calm:.4f} (all-zero={zero_calm:.4f})")
@@ -913,20 +980,23 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
 
             # NEW: test ratios vs all-zero baseline
-            zpnz_t, nzpz_t = _zero_nonzero_ratios(df_truth_test, df_pred_test, eps=ZERO_EPS)
+            zpnz_t, nzpz_t = _zero_nonzero_ratios(df_truth_test, df_pred_test, threshold=tuned_threshold)
             locs_t = [c for c in df_truth_test.columns if c != "timestamp"]
             df_zero_long_t = pd.DataFrame({
                 "timestamp": np.repeat(df_truth_test["timestamp"].values, len(locs_t)),
                 "location": np.tile(locs_t, len(df_truth_test)),
                 "pred": 0.0
             })
-            zpnz_t0, nzpz_t0 = _zero_nonzero_ratios(df_truth_test, df_zero_long_t, eps=ZERO_EPS)
+            zpnz_t0, nzpz_t0 = _zero_nonzero_ratios(df_truth_test, df_zero_long_t, threshold=tuned_threshold)
+            prec_t, rec_t, f1_t = _precision_recall(df_truth_test, df_pred_test, threshold=tuned_threshold)
 
             print(f"[Val {label}] Epoch {epoch}: Testing RMSE={rmse_test:.4f} (all-zero RMSE={zero_rmse_test:.4f})")
             print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero ratio={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
                   f"(all-zero={zpnz_t0 if np.isfinite(zpnz_t0) else float('nan'):.4f}) | "
                   f"Nonzero→Zero ratio={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
                   f"(all-zero={nzpz_t0 if np.isfinite(nzpz_t0) else float('nan'):.4f})")
+            print(f"[Val {label}] Epoch {epoch}: Test Precision={prec_t if np.isfinite(prec_t) else float('nan'):.4f} "
+                  f"Recall={rec_t if np.isfinite(rec_t) else float('nan'):.4f} F1={f1_t if np.isfinite(f1_t) else float('nan'):.4f}")
 
     return _callback
 
@@ -958,7 +1028,10 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             weight_decay=WEIGHT_DECAY
         )
 
-    loss_fn = nn.MSELoss()
+    def weighted_mse(pred, target):
+        weights = torch.ones_like(target)
+        weights = torch.where(target <= ZERO_EPS, ZERO_FP_WEIGHT, 1.0)
+        return torch.mean((pred - target) ** 2 * weights)
 
     for epoch in range(EPOCHS):
         model.train()
@@ -974,7 +1047,7 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
 
             opt.zero_grad()
             pred = model(xb)                       # (B, N, H)
-            loss = loss_fn(pred, yb)
+            loss = weighted_mse(pred, yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
@@ -1140,14 +1213,14 @@ def main():
         print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
 
         # NEW: final test ratios for 24h
-        zpnz_24, nzpz_24 = _zero_nonzero_ratios(df_t24, df24, eps=ZERO_EPS)
+        zpnz_24, nzpz_24 = _zero_nonzero_ratios(df_t24, df24, threshold=OUTAGE_THRESHOLD)
         locs24 = [c for c in df_t24.columns if c != "timestamp"]
         df_zero_long_24 = pd.DataFrame({
             "timestamp": np.repeat(df_t24["timestamp"].values, len(locs24)),
             "location": np.tile(locs24, len(df_t24)),
             "pred": 0.0
         })
-        zpnz_24_0, nzpz_24_0 = _zero_nonzero_ratios(df_t24, df_zero_long_24, eps=ZERO_EPS)
+        zpnz_24_0, nzpz_24_0 = _zero_nonzero_ratios(df_t24, df_zero_long_24, threshold=OUTAGE_THRESHOLD)
         print(f"[Test 24h] Zero→Nonzero ratio={zpnz_24 if np.isfinite(zpnz_24) else float('nan'):.4f} "
               f"(all-zero={zpnz_24_0 if np.isfinite(zpnz_24_0) else float('nan'):.4f}) | "
               f"Nonzero→Zero ratio={nzpz_24 if np.isfinite(nzpz_24) else float('nan'):.4f} "
@@ -1175,14 +1248,14 @@ def main():
         print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
 
         # NEW: final test ratios for 48h
-        zpnz_48, nzpz_48 = _zero_nonzero_ratios(df_t48, df48, eps=ZERO_EPS)
+        zpnz_48, nzpz_48 = _zero_nonzero_ratios(df_t48, df48, threshold=OUTAGE_THRESHOLD)
         locs48 = [c for c in df_t48.columns if c != "timestamp"]
         df_zero_long_48 = pd.DataFrame({
             "timestamp": np.repeat(df_t48["timestamp"].values, len(locs48)),
             "location": np.tile(locs48, len(df_t48)),
             "pred": 0.0
         })
-        zpnz_48_0, nzpz_48_0 = _zero_nonzero_ratios(df_t48, df_zero_long_48, eps=ZERO_EPS)
+        zpnz_48_0, nzpz_48_0 = _zero_nonzero_ratios(df_t48, df_zero_long_48, threshold=OUTAGE_THRESHOLD)
         print(f"[Test 48h] Zero→Nonzero ratio={zpnz_48 if np.isfinite(zpnz_48) else float('nan'):.4f} "
               f"(all-zero={zpnz_48_0 if np.isfinite(zpnz_48_0) else float('nan'):.4f}) | "
               f"Nonzero→Zero ratio={nzpz_48 if np.isfinite(nzpz_48) else float('nan'):.4f} "
