@@ -16,7 +16,7 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
 # OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_new_lora_2"
+OUT_DIR   = "results_seq_mse_pre-CB_contrastive_use-moe/update"
 # OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
 # OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -103,7 +103,7 @@ REGIME_TRIPLET_MARGIN  = 1.0    # margin for triplet-style loss
 # ========= NEW: Tail-aware training to reduce smoothing =========
 USE_QUANTILE_WEIGHTS = True
 QUANTILE_WEIGHTS     = [0.1, 0.2, 0.7]   # emphasize high quantile (match len(QUANTILES))
-USE_PEAK_WEIGHTING   = True              # emphasize top-K hours in each horizon
+USE_PEAK_WEIGHTING   = True              # emphasize top-K target hours in each horizon
 PEAK_TOP_K           = 6                 # number of hours to upweight (min with H)
 PEAK_MULT            = 3.0               # multiplicative weight for those hours
 
@@ -140,6 +140,7 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
     for i in range(N):
         Xw.append(X_loc[i:i+seq_len])                    # past seq_len
         Yw.append(y_loc[i+seq_len:i+seq_len+horizon])    # next horizon
+        # Xw: (N, seq_len, D)  Yw: (N, horizon)
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
 # -------------------- PatchTST encoder --------------------
@@ -694,14 +695,16 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)       # (T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)    # (T, N, F)
 
-    # ---- NEW: hour-of-day sin/cos (already in [-1,1], no scaling) ----
-    hours = pd.to_datetime(ts).hour.values
-    hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)   # (T,)
-    hod_cos = np.cos(2 * np.pi * hours / 24.0).astype(float)
-    time_feat = np.stack([hod_sin, hod_cos], axis=-1)          # (T, 2)
-    time_feat = np.tile(time_feat[:, None, :], (1, N, 1))      # (T, N, 2)
-
-    X_all = np.concatenate([y_sc[..., None], w_sc, time_feat], axis=2)  # (T, N, Din)
+    # ---- hour-of-day features are ONLY added when NOT using CB encoder ----
+    if not USE_CB_ENCODER:  # <<< keep CB input dim equal to its checkpoint (e.g., 110)
+        hours = pd.to_datetime(ts).hour.values
+        hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)   # (T,)
+        hod_cos = np.cos(2 * np.pi * hours / 24.0).astype(float)
+        time_feat = np.stack([hod_sin, hod_cos], axis=-1)          # (T, 2)
+        time_feat = np.tile(time_feat[:, None, :], (1, N, 1))      # (T, N, 2)
+        X_all = np.concatenate([y_sc[..., None], w_sc, time_feat], axis=2)
+    else:
+        X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
     Din = X_all.shape[2]
 
     # window counts
@@ -713,7 +716,6 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
     # ---- compute regime labels per *window index* based on the start of future horizon ----
-    # day of future start for window i is at time i+SEQ_LEN
     _, day_score_all = _per_day_outage_score(ds_train, method=EVENT_METHOD)
     train_days = np.arange(1, train_last_day + 1, dtype=int)
     thr_storm = np.quantile(day_score_all[train_days - 1], STORM_TOP_Q)
@@ -1317,14 +1319,17 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)    # (T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, F)
 
-    # Hour-of-day sin/cos (no scaling)
-    hours = ts.hour.values
-    hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)
-    hod_cos = np.cos(2 * np.pi * hours / 24.0).astype(float)
-    time_feat = np.stack([hod_sin, hod_cos], axis=-1)          # (T, 2)
-    time_feat = np.tile(time_feat[:, None, :], (1, N, 1))      # (T, N, 2)
+    # Hour-of-day features ONLY when not using CB encoder (to keep CB input dim fixed)  # <<<
+    if not USE_CB_ENCODER:
+        hours = ts.hour.values
+        hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)
+        hod_cos = np.cos(2 * np.pi * hours / 24.0).astype(float)
+        time_feat = np.stack([hod_sin, hod_cos], axis=-1)          # (T, 2)
+        time_feat = np.tile(time_feat[:, None, :], (1, N, 1))      # (T, N, 2)
+        X_all = np.concatenate([y_sc[..., None], w_sc, time_feat], axis=2)   # (T, N, Din)
+    else:
+        X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)             # (T, N, Din)
 
-    X_all = np.concatenate([y_sc[..., None], w_sc, time_feat], axis=2)   # (T, N, Din)
     Din = X_all.shape[2]
 
     rows = []
