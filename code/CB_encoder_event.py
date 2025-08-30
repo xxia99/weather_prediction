@@ -16,7 +16,7 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
 # OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = "results_seq_mse_pre-CB_contrastive_use-moe/update"
+OUT_DIR   = "results_seq_mse_pre-CB_contrastive_use-moe/update_rmse"
 # OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
 # OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -39,7 +39,7 @@ PATCH_STRIDE   = None       # None -> non-overlapping (stride = PATCH_LEN)
 PATCH_D_MODEL  = 64         # token/patch embedding size
 PATCH_NHEAD    = 4
 PATCH_NLAYERS  = 2
-PATCH_DROPOUT  = 0.05     # reduce transformer dropout
+PATCH_DROPOUT  = 0.05       # reduce transformer dropout
 PATCH_FF       = 4 * PATCH_D_MODEL  # transformer FFN width
 
 # --------- StemGNN hyperparams (lightweight, tunable) ----------
@@ -63,10 +63,11 @@ if "patch" in OUT_DIR:
 else:
     USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
-# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
-# CB_ENCODER_CKPT = "results_lora_variables-only/pretrained_cb_encoder_peft_independent_H24.pt"
-# CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"   # best so far
+# CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"
+# CB_ENCODER_CKPT         = "results_lora_variables-only/pretrained_cb_encoder_peft_independent_H24.pt"
+# CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
 CB_ENCODER_CKPT = "results_lora/new/pretrained_cb_encoder_peft_independent_H24.pt"
+
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 
@@ -91,7 +92,18 @@ W_MOE_AUX      = 1e-2      # weight for MoE load-balancing aux loss (KL to unifo
 # ========= NEW: Probabilistic head with quantiles =========
 USE_QUANTILES   = True                       # if False -> classic point MSE
 QUANTILES       = [0.1, 0.5, 0.9]            # any list of (0,1); 0.5 is median
-PRED_QUANTILE   = 0.95                       # slightly more surge-seeking
+PRED_QUANTILE   = 0.80                       # fallback single-quantile if blend disabled
+
+# ---- NEW (reduce RMSE while keeping trends): point forecast as convex blend of quantiles
+USE_POINT_BLEND       = True
+POINT_BLEND_WEIGHTS   = [0.2, 0.5, 0.3]      # weights for [q10, q50, q90] (sum to 1)
+
+# ========= NEW: Tail-aware training to reduce smoothing =========
+USE_QUANTILE_WEIGHTS = True
+QUANTILE_WEIGHTS     = [0.2, 0.5, 0.3]       # emphasize median a bit, keep q90 influence
+USE_PEAK_WEIGHTING   = True                  # emphasize top-K target hours in each horizon
+PEAK_TOP_K           = 4                     # number of hours to upweight (min with H)
+PEAK_MULT            = 1.5                   # multiplicative weight for those hours
 
 # ========= NEW: Regime-aware auxiliary (calm vs storm) =========
 USE_REGIME_AUX         = True   # enable regime prototypes & auxiliary losses
@@ -100,12 +112,8 @@ W_REGIME_BCE           = 1e-1   # weight for BCE(supervised) on storm prob
 W_REGIME_TRIPLET       = 1e-1   # weight for margin loss against opposite prototype
 REGIME_TRIPLET_MARGIN  = 1.0    # margin for triplet-style loss
 
-# ========= NEW: Tail-aware training to reduce smoothing =========
-USE_QUANTILE_WEIGHTS = True
-QUANTILE_WEIGHTS     = [0.1, 0.2, 0.7]   # emphasize high quantile (match len(QUANTILES))
-USE_PEAK_WEIGHTING   = True              # emphasize top-K target hours in each horizon
-PEAK_TOP_K           = 6                 # number of hours to upweight (min with H)
-PEAK_MULT            = 3.0               # multiplicative weight for those hours
+# ========= NEW: Mean-matching auxiliary loss (stabilizes level) =========
+W_MEAN_MSE             = 5e-2
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -140,7 +148,6 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
     for i in range(N):
         Xw.append(X_loc[i:i+seq_len])                    # past seq_len
         Yw.append(y_loc[i+seq_len:i+seq_len+horizon])    # next horizon
-        # Xw: (N, seq_len, D)  Yw: (N, horizon)
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
 # -------------------- PatchTST encoder --------------------
@@ -361,11 +368,9 @@ class _GraphDiffusion(nn.Module):
     def forward(self, x, A):
         # x: (B, T, N, C), A: (N, N)
         if self.k_order <= 0:
-            # No spatial mixing; identity pass through with mixing layer
             return self.dropout(self.mix(x))
 
         B, T, N, C = x.shape
-        # Build powers: [I, A, A^2, ..., A^K]
         I = torch.eye(N, device=x.device, dtype=x.dtype)
         A_pows = [I]
         Ak = A
@@ -399,7 +404,7 @@ class _StemBlock(nn.Module):
         h  = self.out_norm(h0 + hg)          # residual
         return h
 
-# -------------------- NEW: MoE readout head (now supports arbitrary out_dim) --------------------
+# -------------------- NEW: MoE readout head --------------------
 class MoEReadout(nn.Module):
     """
     Minimal top-k router + MLP experts.
@@ -426,27 +431,19 @@ class MoEReadout(nn.Module):
         logits = self.router(h_last)                 # (B, N, E)
         probs  = torch.softmax(logits, dim=-1)       # (B, N, E)
 
-        # top-k routing (dense combine of selected experts)
         if self.top_k < self.num_experts:
             topv, topi = torch.topk(probs, k=self.top_k, dim=-1)   # (B, N, K)
             norm = torch.clamp(topv.sum(dim=-1, keepdim=True), min=1e-9)
             topw = topv / norm                                     # (B, N, K)
         else:
-            # fall back to dense combine
             topi = torch.arange(self.num_experts, device=h_last.device).view(1,1,self.num_experts).expand(B,N,self.num_experts)
             topw = probs
 
-        # expert outputs stacked: (B, N, OUT_DIM, E)
-        expert_outs = torch.stack([exp(h_last) for exp in self.experts], dim=-1)
-
-        # gather top-k expert outputs: (B,N,OUT_DIM,K)
+        expert_outs = torch.stack([exp(h_last) for exp in self.experts], dim=-1)  # (B,N,OUT,E)
         gather_idx = topi.unsqueeze(-2).expand(B, N, expert_outs.size(-2), self.top_k if self.top_k < self.num_experts else self.num_experts)
         selected = expert_outs.gather(dim=-1, index=gather_idx)
-
-        # combine with weights
         y = (selected * topw.unsqueeze(-2)).sum(dim=-1)            # (B, N, OUT_DIM)
 
-        # auxiliary load-balancing loss: KL(probs_mean || uniform)
         probs_mean = probs.mean(dim=(0,1))                         # (E,)
         eps = 1e-9
         aux = (probs_mean * (torch.log(probs_mean + eps) + math.log(self.num_experts))).sum()
@@ -519,7 +516,6 @@ class STGNNForecaster(nn.Module):
         self.use_regime_aux   = bool(USE_REGIME_AUX)
         self.use_regime_aug   = bool(USE_REGIME_AUGMENT)
         if self.use_regime_aux or self.use_regime_aug:
-            # Two learnable prototypes: calm (0), storm (1)
             self.regime_mem = nn.Parameter(torch.randn(2, STEM_D_MODEL))
         d_readin = STEM_D_MODEL * (2 if self.use_regime_aug else 1)
 
@@ -551,7 +547,6 @@ class STGNNForecaster(nn.Module):
         """
         if not (self.use_regime_aux or self.use_regime_aug):
             return last, None
-        # similarity to prototypes
         sim = torch.einsum('bnd,kd->bnk', last, self.regime_mem)   # (B,N,2)
         weights = torch.softmax(sim, dim=-1)                       # (B,N,2)
         if self.use_regime_aug:
@@ -593,7 +588,6 @@ class STGNNForecaster(nn.Module):
         else:
             return y_flat  # (B,N,H)
 
-    # convenience getters
     def moe_aux_loss(self):
         return self._last_aux_loss
 
@@ -602,9 +596,8 @@ class STGNNForecaster(nn.Module):
 
     def regime_aux_loss(self, labels: torch.Tensor):
         """
-        Compute regime auxiliary losses using stored representation from the last forward pass.
         labels: (B,) where 0=calm, 1=storm, -1=ignore
-        Returns (loss_bce, loss_triplet) where missing pieces are zeros.
+        Returns (loss_bce, loss_triplet)
         """
         if (not self.use_regime_aux) or (self._last_repr is None):
             return torch.tensor(0.0, device=labels.device), torch.tensor(0.0, device=labels.device)
@@ -613,7 +606,7 @@ class STGNNForecaster(nn.Module):
         mem = self.regime_mem                # (2, D)
         weights = self._last_reg_weights     # (B, N, 2) or None
 
-        # ---- BCE on storm probability
+        # BCE on storm probability
         mask = labels >= 0
         if (weights is not None) and mask.any():
             p_storm = weights.mean(dim=1)[..., 1]            # (B,)
@@ -622,7 +615,7 @@ class STGNNForecaster(nn.Module):
         else:
             loss_bce = torch.tensor(0.0, device=z.device)
 
-        # ---- Triplet-style margin using prototypes
+        # Triplet-style margin using prototypes
         if mask.any():
             z_m = z[mask]
             y_m = labels[mask].long()
@@ -679,9 +672,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     Returns:
       X_tr: (num_windows_total, SEQ_LEN, 1, Din)    # one county per sample (N=1)
       Y_tr: (num_windows_total, 1, horizon)
-      Din, scalers (fit on train split)
-      aux: dict with arrays used for validation (scaled series, timestamps, etc.)
-      L_tr: (num_windows_total,) regime labels per window: 0=calm, 1=storm, -1=neutral
+      Din, scalers, aux, labels
     """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
@@ -696,7 +687,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)    # (T, N, F)
 
     # ---- hour-of-day features are ONLY added when NOT using CB encoder ----
-    if not USE_CB_ENCODER:  # <<< keep CB input dim equal to its checkpoint (e.g., 110)
+    if not USE_CB_ENCODER:
         hours = pd.to_datetime(ts).hour.values
         hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)   # (T,)
         hod_cos = np.cos(2 * np.pi * hours / 24.0).astype(float)
@@ -715,7 +706,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     day_last_idx = day_end_idx[train_last_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
-    # ---- compute regime labels per *window index* based on the start of future horizon ----
+    # ---- compute regime labels per window (based on day score of future day) ----
     _, day_score_all = _per_day_outage_score(ds_train, method=EVENT_METHOD)
     train_days = np.arange(1, train_last_day + 1, dtype=int)
     thr_storm = np.quantile(day_score_all[train_days - 1], STORM_TOP_Q)
@@ -1041,7 +1032,6 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         else:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero=nan)")
 
-        # NEW: print ratios
         print(f"[Val {label}] Epoch {epoch}: Zero→Nonzero ratio={zpnz_model if np.isfinite(zpnz_model) else float('nan'):.4f} "
               f"(all-zero={zpnz_zero if np.isfinite(zpnz_zero) else float('nan'):.4f}) | "
               f"Nonzero→Zero ratio={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
@@ -1058,13 +1048,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
 
         # Which metric selects "best"?
-        metric_map = {
-            "overall": rmse_overall,
-            "calm": rmse_calm,
-            "storm": rmse_storm
-        }
+        metric_map = {"overall": rmse_overall, "calm": rmse_calm, "storm": rmse_storm}
         sel = metric_map.get(str(BEST_BY).lower(), rmse_overall)
-        sel_val = sel if np.isfinite(sel) else rmse_overall  # fallback to overall if selected is nan
+        sel_val = sel if np.isfinite(sel) else rmse_overall  # fallback
 
         if np.isfinite(sel_val) and sel_val < best["rmse"]:
             best["rmse"] = sel_val
@@ -1085,7 +1071,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-            # Save predictions, ground truths, and per-day plots
+            # Save per-day csvs and plots
             ts_map = pd.DataFrame({
                 "timestamp": pd.to_datetime(aux["timestamps"]),
                 "day": aux["days"]
@@ -1174,7 +1160,7 @@ def _pinball_loss(yq, y_true, q_list, q_weights=None, time_weights=None):
 
     return loss.mean()
 
-# ---------------- training/infer (UNCHANGED API except labels) ----------------
+# ---------------- training/infer ----------------
 def train_model(X, Y, din, horizon, n_nodes, labels=None, eval_callback=None):
     """
     X: (num_samples, SEQ_LEN, N, din)
@@ -1233,7 +1219,7 @@ def train_model(X, Y, din, horizon, n_nodes, labels=None, eval_callback=None):
             pred = model(xb)                       # (B, N, H) or (B, N, H, Q)
 
             if USE_QUANTILES:
-                # --- NEW: build time weights to emphasize top-K target hours (per sample) ---
+                # --- time weights to emphasize top-K target hours (per sample) ---
                 time_w = None
                 if USE_PEAK_WEIGHTING:
                     with torch.no_grad():
@@ -1245,6 +1231,11 @@ def train_model(X, Y, din, horizon, n_nodes, labels=None, eval_callback=None):
                             time_w = 1.0 + PEAK_MULT * time_w               # (B,N,H)
                 q_w = QUANTILE_WEIGHTS if (USE_QUANTILE_WEIGHTS and (len(QUANTILE_WEIGHTS)==len(QUANTILES))) else None
                 loss = _pinball_loss(pred, yb, QUANTILES, q_weights=q_w, time_weights=time_w)
+
+                # --- mean-matching auxiliary on proxy mean from quantiles ---
+                yq = pred  # (B,N,H,Q)
+                y_mean = (yq[..., 0] + 2.0 * yq[..., 1] + yq[..., 2]) / 4.0
+                loss = loss + W_MEAN_MSE * F.mse_loss(y_mean, yb)
             else:
                 loss = loss_fn_point(pred, yb)
 
@@ -1288,15 +1279,21 @@ def train_model(X, Y, din, horizon, n_nodes, labels=None, eval_callback=None):
 def infer(model, Xin):
     """
     Xin: (1, SEQ_LEN, N, F)
-    Returns: (1, N, H) point forecast by selecting a quantile (if enabled).
+    Returns: (1, N, H) point forecast built from quantiles.
     """
     model.eval()
     out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
     if USE_QUANTILES:
-        # (1, N, H, Q) -> select chosen quantile along last axis
-        qs = np.array(QUANTILES, dtype=float)
-        idx = int(np.argmin(np.abs(qs - float(PRED_QUANTILE))))
-        out = out[..., idx]  # (1, N, H)
+        if USE_POINT_BLEND and (len(POINT_BLEND_WEIGHTS) == out.size(-1)):
+            # convex blend across provided quantiles
+            w = torch.tensor(POINT_BLEND_WEIGHTS, device=out.device, dtype=out.dtype)
+            w = w / (w.sum() + 1e-12)
+            out = (out * w.view(1,1,1,-1)).sum(dim=-1)  # (1, N, H)
+        else:
+            # fallback: select chosen quantile
+            qs = np.array(QUANTILES, dtype=float)
+            idx = int(np.argmin(np.abs(qs - float(PRED_QUANTILE))))
+            out = out[..., idx]  # (1, N, H)
     return out.cpu().numpy()
 
 # ---------------- pipeline helpers (train windows only) ----------------
@@ -1319,7 +1316,7 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)    # (T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F) # (T, N, F)
 
-    # Hour-of-day features ONLY when not using CB encoder (to keep CB input dim fixed)  # <<<
+    # Hour-of-day features ONLY when not using CB encoder (to keep CB input dim fixed)
     if not USE_CB_ENCODER:
         hours = ts.hour.values
         hod_sin = np.sin(2 * np.pi * hours / 24.0).astype(float)
@@ -1414,13 +1411,12 @@ def main():
 
     # ==== 24h ====
     X24, Y24, Din, scalers24, aux24, L24 = prepare_training(ds_train, horizon=H24)
-    n_nodes = 1  # <<< single-node per sample
+    n_nodes = 1  # single-node per sample
     val_cb24 = make_val_callback_rolling(
         ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
     )
     mdl24 = train_model(X24, Y24, Din, H24, n_nodes, labels=L24 if USE_REGIME_AUX else None, eval_callback=val_cb24)
-    # mdl24 = None
 
     # ==== 48h ====
     X48, Y48, _, scalers48, aux48, L48 = prepare_training(ds_train, horizon=H48)
@@ -1450,7 +1446,7 @@ def main():
         test_rmse_24 = per_county_rmse_mean(df_t24, df24)
         print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
 
-        # NEW: final test ratios for 24h
+        # final test ratios for 24h
         zpnz_24, nzpz_24 = _zero_nonzero_ratios(df_t24, df24, eps=ZERO_EPS)
         locs24 = [c for c in df_t24.columns if c != "timestamp"]
         df_zero_long_24 = pd.DataFrame({
@@ -1485,7 +1481,7 @@ def main():
         test_rmse_48 = per_county_rmse_mean(df_t48, df48)
         print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
 
-        # NEW: final test ratios for 48h
+        # final test ratios for 48h
         zpnz_48, nzpz_48 = _zero_nonzero_ratios(df_t48, df48, eps=ZERO_EPS)
         locs48 = [c for c in df_t48.columns if c != "timestamp"]
         df_zero_long_48 = pd.DataFrame({
