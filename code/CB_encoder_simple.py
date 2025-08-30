@@ -10,42 +10,45 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
-# ---------------- config ----------------
+# ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_simple_gru/initial"
+OUT_DIR   = "results_seq_tcn_minimal"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ---- surge ranking CSV (for sample weighting) ----
-SURGE_CSV_PATH       = "results_surge/surge_ranking_mean.csv"
-USE_SURGE_PRIOR      = True
-SURGE_LEVELS_STORM   = {"Severe", "Extreme"}
-SURGE_LEVELS_CALMISH = {"Calm", "Mild"}
-DEFAULT_STORM_PRIOR  = 0.20
-CB_BETA              = 0.999
-CLIP_POS_WEIGHT      = 10.0
-
-# ---- core training ----
+# core training
 SEQ_LEN       = 24
 BATCH_SIZE    = 64
 EPOCHS        = 40
-LR            = 5e-4
-WEIGHT_DECAY  = 5e-5
-DEVICE        = "cuda:1" if torch.cuda.is_available() else "cpu"
+LR            = 8e-4
+WEIGHT_DECAY  = 1e-4
+DEVICE        = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# ---- regularization ----
-TEMPORAL_DROP_PROB = 0.0  # keep available; set to 0 by default
+# model width/depth
+TCN_D_MODEL   = 64
+TCN_DROPOUT   = 0.15
+TCN_KSIZE     = 3
+TCN_LEVELS    = 4            # dilations: 1,2,4,8
 
-# ---- day split ----
-TRAIN_LAST_DAY = 80   # 1..80 train; roll on 81..end
+# quantiles + point
+USE_QUANTILES  = True
+QUANTILES      = [0.1, 0.5, 0.9]
+PRED_QUANTILE  = 0.90
+HUBER_DELTA    = 1.0         # for point aux loss
+POINT_BLEND    = np.array([0.2, 0.35, 0.45], dtype=np.float32)  # to align with RMSE
 
-# ---- event-stratified validation ----
+# learning tricks
+USE_SWA             = True   # Stochastic Weight Averaging for final 25% epochs
+SWA_START_FRAC      = 0.75
+MAX_GRAD_NORM       = 5.0
+
+# day split + validation strategy (unchanged)
+TRAIN_LAST_DAY = 80
 EVENT_METHOD   = "mean"
 STORM_TOP_Q    = 0.80
 CALM_BOTTOM_Q  = 0.50
 CALM_N         = 10
-BEST_BY        = "overall"  # "overall" | "calm" | "storm"
+BEST_BY        = "overall"
 
-# ---- zero/nonzero diagnostics ----
 ZERO_EPS = 1e-8
 
 # =======================================================
@@ -81,51 +84,84 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
 # =======================================================
-# SIMPLE FORECASTER (minimal, trend-friendly)
+# TCN forecaster (minimal, regularized)
 # =======================================================
-class SimpleGRUForecaster(nn.Module):
-    """
-    Minimal per-node GRU forecaster with residual head:
-      pred_t..t+H = last_y + f(GRU(history, weather))
-    Inputs:
-      x: (B, T, N, F) where F = 1 (y) + weather features
-    Output:
-      y: (B, N, H)
-    """
-    def __init__(self, in_channels: int, horizon: int, num_nodes: int,
-                 hidden: int = 128, dropout: float = 0.1):
-        super().__init__()
-        self.in_channels = in_channels
-        self.horizon     = horizon
-        self.num_nodes   = num_nodes
+def _causal_conv1d(x, conv, dilation, ksize):
+    # x: (B*N, C, T)
+    pad = (ksize - 1) * dilation
+    x = nn.functional.pad(x, (pad, 0))
+    return conv(x)
 
-        self.in_norm = nn.LayerNorm(in_channels)
-        self.gru     = nn.GRU(input_size=in_channels, hidden_size=hidden,
-                              num_layers=1, batch_first=True)
-        self.drop    = nn.Dropout(dropout)
-        self.head    = nn.Linear(hidden, horizon)
+class _TCNBlock(nn.Module):
+    def __init__(self, c_in, c_out, ksize=3, dilation=1, dropout=0.1):
+        super().__init__()
+        self.ksize = ksize
+        self.dil = dilation
+        self.conv1 = nn.Conv1d(c_in, c_out, kernel_size=ksize, dilation=dilation)
+        self.conv2 = nn.Conv1d(c_out, c_out, kernel_size=ksize, dilation=dilation)
+        self.act   = nn.GELU()
+        self.drop  = nn.Dropout(dropout)
+        self.res   = nn.Conv1d(c_in, c_out, kernel_size=1) if c_in != c_out else nn.Identity()
+        self.norm1 = nn.BatchNorm1d(c_out)
+        self.norm2 = nn.BatchNorm1d(c_out)
 
     def forward(self, x):
-        # x: (B, T, N, F) -> process nodes independently
+        # x: (B*N, C, T)
+        y = _causal_conv1d(x, self.conv1, self.dil, self.ksize)
+        y = self.norm1(self.act(y))
+        y = self.drop(y)
+        y = _causal_conv1d(y, self.conv2, self.dil, self.ksize)
+        y = self.norm2(self.act(y))
+        y = self.drop(y)
+        return y + self.res(x)
+
+class TCNForecaster(nn.Module):
+    """
+    Input:  (B, T, N, F)
+    Output: (B, N, H, Q) if USE_QUANTILES else (B, N, H)
+    """
+    def __init__(self, in_channels, horizon, num_nodes):
+        super().__init__()
+        self.num_nodes   = num_nodes
+        self.horizon     = horizon
+        self.in_channels = in_channels
+        self.n_quantiles = len(QUANTILES) if USE_QUANTILES else 1
+        out_dim = horizon * self.n_quantiles
+
+        self.in_proj = nn.Linear(in_channels, TCN_D_MODEL)
+
+        layers = []
+        c = TCN_D_MODEL
+        for i in range(TCN_LEVELS):
+            dil = 2 ** i
+            layers.append(_TCNBlock(c, c, ksize=TCN_KSIZE, dilation=dil, dropout=TCN_DROPOUT))
+        self.tcn = nn.Sequential(*layers)
+
+        self.head = nn.Sequential(
+            nn.Linear(TCN_D_MODEL, TCN_D_MODEL),
+            nn.GELU(),
+            nn.Dropout(TCN_DROPOUT),
+            nn.Linear(TCN_D_MODEL, out_dim),
+        )
+
+    def forward(self, x):
         B, T, N, F = x.shape
-        assert F == self.in_channels, f"Forecaster expected F={self.in_channels}, got {F}"
-        # flatten node dim
-        x_bn = x.permute(0,2,1,3).reshape(B*N, T, F)
-        # layernorm per time step across features
-        x_bn = self.in_norm(x_bn)
-        # GRU
-        out, _ = self.gru(x_bn)                # (B*N, T, H)
-        h_last = self.drop(out[:, -1, :])      # (B*N, H)
-        delta  = self.head(h_last)             # (B*N, horizon)
-        # residual on last observed y (feature index 0 by construction)
-        last_y = x[:, -1, :, 0].reshape(B*N, 1)
-        pred   = last_y + delta                # (B*N, horizon)
-        # restore node dim
-        pred = pred.view(B, N, self.horizon)
-        return pred
+        assert N == self.num_nodes and F == self.in_channels, \
+            f"TCN input mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
+
+        # (B,T,N,F) -> (B*N, T, F) -> project -> (B*N, C, T)
+        x = x.permute(0,2,1,3).contiguous().view(B*N, T, F)
+        x = self.in_proj(x)                     # (B*N, T, C)
+        x = x.permute(0,2,1).contiguous()      # (B*N, C, T)
+
+        h = self.tcn(x)                         # (B*N, C, T)
+        h_last = h[:, :, -1]                    # (B*N, C)
+        y = self.head(h_last)                   # (B*N, H*Q or H)
+        y = y.view(B, N, self.horizon, self.n_quantiles)
+        return y
 
 # =======================================================
-# day utilities & scalers
+# day split & scalers
 # =======================================================
 def _compute_day_indices(ts: np.ndarray):
     ts_pd = pd.to_datetime(ts)
@@ -150,36 +186,9 @@ def _fit_scalers_train_only(y, w, days, train_last_day):
     return {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
 
 # =======================================================
-# surge prior (for weighting) — unchanged behavior
+# training split
 # =======================================================
-def _load_storm_prior(csv_path: str, train_last_day: int) -> float:
-    if not (USE_SURGE_PRIOR and os.path.exists(csv_path)):
-        return DEFAULT_STORM_PRIOR
-    df = pd.read_csv(csv_path)
-    if "day_index" not in df.columns or "level" not in df.columns:
-        return DEFAULT_STORM_PRIOR
-    df = df[df["day_index"] <= int(train_last_day)].copy()
-    total = max(1, len(df))
-    storm = (df["level"].astype(str).isin(list(SURGE_LEVELS_STORM))).sum()
-    prior = float(storm) / float(total)
-    return float(np.clip(prior, 0.02, 0.8))
-
-def _cb_pos_weight_from_prior(prior: float, beta: float = CB_BETA, cap: float = CLIP_POS_WEIGHT) -> float:
-    raw = (1.0 - prior) / max(prior, 1e-6)
-    eff = min(cap, raw)
-    return float(eff)
-
-# =======================================================
-# training data prep (returns sample weights)
-# =======================================================
-def prepare_training_split(ds_train, horizon, train_last_day=80):
-    """
-    Returns:
-      X_tr: (num_windows, SEQ_LEN, 1, Din)
-      Y_tr: (num_windows, 1, horizon)
-      W_tr: (num_windows,)
-      Din, scalers, aux
-    """
+def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
     ts = pd.to_datetime(ds_train.timestamp.values)
@@ -190,7 +199,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)  # (T, N, Din)
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)   # (T, N, Din)
 
     day_last_idx = day_end_idx[train_last_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
@@ -207,36 +216,20 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
         raise RuntimeError("No training windows after split; check SEQ_LEN/horizon/TRAIN_LAST_DAY.")
     X_tr = np.concatenate(X_list, axis=0)
     Y_tr = np.concatenate(Y_list, axis=0)
-
-    # ---- surge-aware sample weights (same logic as before) ----
-    storm_prior = _load_storm_prior(SURGE_CSV_PATH, train_last_day=TRAIN_LAST_DAY)
-    pos_w = _cb_pos_weight_from_prior(storm_prior)
-    y_max = np.max(Y_tr, axis=2).reshape(-1)
-    thr = np.quantile(y_max, max(0.0, 1.0 - storm_prior))
-    is_storm_like = (y_max >= thr)
-    W_tr = np.where(is_storm_like, pos_w, 1.0).astype(np.float32)
-
     aux = {
         "X_all_scaled": X_all,
         "y_scaled": y_sc,
         "timestamps": ts,
         "days": days,
-        "day_end_idx": day_end_idx,
-        "storm_prior": storm_prior,
-        "storm_thr_scaled": float(thr),
-        "pos_weight": float(pos_w),
+        "day_end_idx": day_end_idx
     }
-    return X_tr, Y_tr, W_tr, Din, scalers, aux
-
-def prepare_training(ds_train, horizon):
-    X, Y, W, Din, scalers, aux = prepare_training_split(ds_train, horizon, TRAIN_LAST_DAY)
-    return X, Y, W, Din, scalers, aux
+    return X_tr, Y_tr, Din, scalers, aux
 
 # =======================================================
-# validation roll (unchanged)
+# validation roll (unchanged logic)
 # =======================================================
 @torch.no_grad()
-def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80):
+def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=TRAIN_LAST_DAY):
     model.eval()
     X_all = aux["X_all_scaled"]
     ts    = aux["timestamps"]
@@ -263,16 +256,12 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=80):
             y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
             pred = (pred_sc * y_sd) + y_mu
             pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+            rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
 
-            rows.append(pd.DataFrame({
-                "timestamp": ts_future,
-                "location": county,
-                "pred": pred.astype(float)
-            }))
     df_pred = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["timestamp", "location", "pred"])
     return df_pred
 
-def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
+def truth_wide_for_val(ds_train, aux, horizon, train_last_day=TRAIN_LAST_DAY):
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
@@ -352,7 +341,7 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     nz_to_z = np.sum((~true_zero) & pred_zero) / denom_nz if denom_nz > 0 else float("nan")
     return float(z_to_nz), float(nz_to_z)
 
-# ---- event helpers & callback (unchanged in logic) ----
+# -------- event helpers & callback (unchanged) --------
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
     days, _, _ = _compute_day_indices(ts)
@@ -431,7 +420,7 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
     return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
 
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
-                              train_last_day=80,
+                              train_last_day=TRAIN_LAST_DAY,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
@@ -468,9 +457,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         else:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero=nan)")
 
-        print(f"[Val {label}] Epoch {epoch}: Zero→Nonzero ratio={zpnz_model if np.isfinite(zpnz_model) else float('nan'):.4f} "
+        print(f"[Val {label}] Epoch {epoch}: Zero→Nonzero={zpnz_model if np.isfinite(zpnz_model) else float('nan'):.4f} "
               f"(all-zero={zpnz_zero if np.isfinite(zpnz_zero) else float('nan'):.4f}) | "
-              f"Nonzero→Zero ratio={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
+              f"Nonzero→Zero={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
               f"(all-zero={nzpz_zero if np.isfinite(nzpz_zero) else float('nan'):.4f})")
 
         if np.isfinite(rmse_calm):
@@ -506,46 +495,32 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-            ts_map = pd.DataFrame({
-                "timestamp": pd.to_datetime(aux["timestamps"]),
-                "day": aux["days"]
-            })
-            df_pred_day = df_pred_val.merge(ts_map, on="timestamp", how="left")
+            ts_map = pd.DataFrame({"timestamp": pd.to_datetime(aux["timestamps"]), "day": aux["days"]})
+            df_pred_day  = df_pred_val.merge(ts_map, on="timestamp", how="left")
             df_truth_day = df_truth_val.merge(ts_map, on="timestamp", how="left")
 
             unique_days = sorted(df_pred_day["day"].dropna().unique())
             for d in unique_days:
-                pred_d = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
+                pred_d  = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
                 truth_d = df_truth_day[df_truth_day["day"] == d].drop(columns="day")
-                pred_path = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
+                pred_path  = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
                 truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_day{int(d)}_{label}.csv")
-                pred_d.to_csv(pred_path, index=False)
-                truth_d.to_csv(truth_path, index=False)
-                print(f"[Val {label}] Saved day {int(d)} prediction/truth data: {pred_path}, {truth_path}")
+                pred_d.to_csv(pred_path, index=False); truth_d.to_csv(truth_path, index=False)
 
             if unique_days:
                 fig, axes = plt.subplots(len(unique_days), 1, figsize=(8, 3 * len(unique_days)), sharex=False)
-                if len(unique_days) == 1:
-                    axes = [axes]
+                if len(unique_days) == 1: axes = [axes]
                 for ax, d in zip(axes, unique_days):
                     truth_d = df_truth_day[df_truth_day["day"] == d].set_index("timestamp").drop(columns="day")
                     truth_mean = truth_d.mean(axis=1).reset_index(name="truth")
-                    pred_mean = (
-                        df_pred_day[df_pred_day["day"] == d]
-                        .groupby("timestamp")["pred"].mean().reset_index()
-                    )
+                    pred_mean  = df_pred_day[df_pred_day["day"] == d].groupby("timestamp")["pred"].mean().reset_index()
                     merged = pd.merge(truth_mean, pred_mean, on="timestamp", how="inner").sort_values("timestamp")
                     ax.plot(merged["timestamp"], merged["truth"], label="Truth")
                     ax.plot(merged["timestamp"], merged["pred"], label="Prediction")
-                    ax.set_title(f"Day {int(d)}")
-                    ax.set_xlabel("timestamp")
-                    ax.set_ylabel("outage")
-                    ax.legend()
-                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
+                    ax.set_title(f"Day {int(d)}"); ax.set_xlabel("timestamp"); ax.set_ylabel("outage"); ax.legend()
                 fig.tight_layout()
-                fig.savefig(fig_path)
+                fig.savefig(os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png"))
                 plt.close(fig)
-                print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
 
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
@@ -561,9 +536,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             zpnz_t0, nzpz_t0 = _zero_nonzero_ratios(df_truth_test, df_zero_long_t, eps=ZERO_EPS)
 
             print(f"[Val {label}] Epoch {epoch}: Testing RMSE={rmse_test:.4f} (all-zero RMSE={zero_rmse_test:.4f})")
-            print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero ratio={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
+            print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
                   f"(all-zero={zpnz_t0 if np.isfinite(zpnz_t0) else float('nan'):.4f}) | "
-                  f"Nonzero→Zero ratio={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
+                  f"Nonzero→Zero={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
                   f"(all-zero={nzpz_t0 if np.isfinite(nzpz_t0) else float('nan'):.4f})")
 
     return _callback
@@ -571,66 +546,105 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
 # =======================================================
 # training / inference
 # =======================================================
-def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
-    """
-    X: (num_samples, SEQ_LEN, N, din)
-    Y: (num_samples, N, horizon)
-    W: (num_samples,)
-    """
+def _pinball_loss(yq, y_true, q_list, quantile_weights=None):
+    # yq: (B,N,H,Q), y_true: (B,N,H)
+    qs = torch.tensor(q_list, device=yq.device, dtype=yq.dtype).view(1,1,1,-1)
+    diff = y_true.unsqueeze(-1) - yq
+    loss = torch.maximum(qs * diff, (qs - 1.0) * diff)    # pinball
+    if quantile_weights is not None:
+        qw = torch.tensor(quantile_weights, device=yq.device, dtype=yq.dtype)
+        qw = qw / torch.clamp(qw.sum(), min=1e-8)
+        loss = loss * qw.view(1,1,1,-1)
+    return loss.mean()
+
+def _huber(x, delta=1.0):
+    absx = torch.abs(x)
+    quad = torch.minimum(absx, torch.tensor(delta, device=x.device, dtype=x.dtype))
+    lin  = absx - quad
+    return 0.5 * quad * quad + delta * lin
+
+def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     if len(X) == 0:
         return None
 
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
-                       torch.tensor(Y, dtype=torch.float32),
-                       torch.tensor(W, dtype=torch.float32))
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+                       torch.tensor(Y, dtype=torch.float32))
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
-    model = SimpleGRUForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    model = TCNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # ReduceLROnPlateau on training loss; best-on-val is handled by the callback checkpoint
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
+
+    # Optional SWA in the tail
+    if USE_SWA:
+        from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+        swa_start = int(EPOCHS * SWA_START_FRAC)
+        swa_model = AveragedModel(model)
+        swa_sched = SWALR(opt, swa_lr=LR * 0.5)
 
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0.0
-        start_time = time.time()
-        for xb, yb, wb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
-            xb, yb, wb = xb.to(DEVICE), yb.to(DEVICE), wb.to(DEVICE)
-
-            if TEMPORAL_DROP_PROB > 0.0:
-                with torch.no_grad():
-                    drop_mask = (torch.rand(xb.size(0), xb.size(1), 1, 1, device=xb.device) < TEMPORAL_DROP_PROB).float()
-                    xb = xb * (1.0 - drop_mask)
-
+        for xb, yb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             opt.zero_grad()
-            pred = model(xb)                        # (B, N, H)
-            per   = (pred - yb).pow(2).mean(dim=(1,2))
-            loss  = (per * wb).mean()
+            yq = model(xb)                # (B,N,H,Q)
+
+            # pinball + small huber on blended point to align with RMSE
+            loss = _pinball_loss(yq, yb, QUANTILES, quantile_weights=POINT_BLEND)
+            with torch.no_grad():
+                qw = torch.tensor(POINT_BLEND, device=yq.device, dtype=yq.dtype)
+                qw = qw / qw.sum()
+            y_point = (yq * qw.view(1,1,1,-1)).sum(-1)    # (B,N,H)
+            loss = loss + 0.15 * _huber(y_point - yb, delta=HUBER_DELTA).mean()
+
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
             opt.step()
+
             epoch_loss += loss.item() * xb.size(0)
 
         epoch_loss /= len(dl.dataset)
-        elapsed = time.time() - start_time
-        print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s | LR: {LR:.2e}")
+        # scheduler step
+        sched.step(epoch_loss)
+
+        # SWA averaging after swa_start
+        if USE_SWA and (epoch >= swa_start):
+            swa_model.update_parameters(model)
+            swa_sched.step()
+        print(f"[Epoch {epoch+1}/{EPOCHS}] TrainLoss={epoch_loss:.6f} | LR={opt.param_groups[0]['lr']:.2e}")
 
         if eval_callback is not None:
-            eval_callback(model, epoch + 1)
+            eval_callback(model if not USE_SWA or epoch < swa_start else swa_model, epoch + 1)
 
+    # If SWA used, update BN stats and return swa weights
+    if USE_SWA:
+        from torch.optim.swa_utils import update_bn
+        update_bn(dl, swa_model)
+        return swa_model
     return model
 
 @torch.no_grad()
 def infer(model, Xin):
     model.eval()
-    out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))  # (1, N, H)
+    yq = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))  # (1,N,H,Q)
+    if USE_QUANTILES:
+        qs = np.array(QUANTILES, dtype=float)
+        idx = int(np.argmin(np.abs(qs - float(PRED_QUANTILE))))
+        out = yq[..., idx]
+    else:
+        out = yq
     return out.cpu().numpy()
 
 # =======================================================
-# test-time prediction
+# test-time prediction (unchanged interface)
 # =======================================================
 def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     locs = list(map(str, ds_train.location.values))
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     T, N, F = w.shape
     Din = 1 + F
 
@@ -640,11 +654,8 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
 
     rows = []
     for i, county in enumerate(locs):
-        if T < SEQ_LEN:
-            pred_sc = np.zeros(horizon, dtype=float)
-        else:
-            Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
-            pred_sc = infer(model, Xin_i)[0, 0]
+        Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
+        pred_sc = infer(model, Xin_i)[0, 0]
 
         pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
         pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
@@ -652,7 +663,7 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     return pd.concat(rows, ignore_index=True)
 
 # =======================================================
-# main
+# main (unchanged outputs/plots)
 # =======================================================
 def main():
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
@@ -660,7 +671,6 @@ def main():
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
 
     _ = get_all_features(ds_train)
-
     ts24 = pd.to_datetime(ds_test24.timestamp.values)
     ts48 = pd.to_datetime(ds_test48.timestamp.values)
     H24, H48 = len(ts24), len(ts48)
@@ -671,109 +681,55 @@ def main():
     zero_rmse_24 = _all_zero_rmse_for_truth(df_t24)
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
-    # ==== 24h ====
-    X24, Y24, W24, Din, scalers24, aux24 = prepare_training(ds_train, horizon=H24)
+    # ---- Prepare once
+    X24, Y24, Din, scalers24, aux24 = prepare_training_split(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
+    X48, Y48, _,  scalers48, aux48  = prepare_training_split(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
     n_nodes = 1
-    val_cb24 = make_val_callback_rolling(
-        ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
-        ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
-    )
-    mdl24 = train_model(X24, Y24, W24, Din, H24, n_nodes, eval_callback=val_cb24)
 
-    # ==== 48h ====
-    X48, Y48, W48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)
-    val_cb48 = make_val_callback_rolling(
-        ds_train, scalers48, H48, aux48, label="48h", train_last_day=TRAIN_LAST_DAY,
-        ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48
-    )
-    mdl48 = train_model(X48, Y48, W48, Din, H48, n_nodes, eval_callback=val_cb48)
+    # ---- 24h
+    val_cb24 = make_val_callback_rolling(ds_train, scalers24, H24, aux24, label="24h",
+                                         train_last_day=TRAIN_LAST_DAY,
+                                         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24)
+    mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
 
-    # ----- Test evaluation & outputs -----
-    if mdl24 is not None:
-        best24_path = os.path.join(OUT_DIR, "best_enc-dec_24h.pt")
-        if os.path.exists(best24_path):
-            ckpt24 = torch.load(best24_path, map_location=DEVICE)
+    # ---- 48h
+    val_cb48 = make_val_callback_rolling(ds_train, scalers48, H48, aux48, label="48h",
+                                         train_last_day=TRAIN_LAST_DAY,
+                                         ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48)
+    mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
+
+    # ----- Final test with best checkpoint if present -----
+    def _finalize(model, scalers, H, ts_future, df_truth, tag, zero_rmse):
+        best_path = os.path.join(OUT_DIR, f"best_enc-dec_{tag}.pt")
+        if os.path.exists(best_path):
+            ckpt = torch.load(best_path, map_location=DEVICE)
             try:
-                mdl24.load_state_dict(ckpt24["model_state_dict"])
-                rmse24_val = ckpt24.get("rmse_select", ckpt24.get("rmse", None))
-                ep24 = ckpt24.get("epoch", None)
-                if isinstance(rmse24_val, (float, int)):
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val selected RMSE={rmse24_val:.4f}, best_by={ckpt24.get('best_by','overall')})")
-                else:
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24})")
+                model.load_state_dict(ckpt["model_state_dict"])
+                print(f"[{tag}] Loaded best checkpoint (epoch {ckpt.get('epoch')}, val-selected RMSE={ckpt.get('rmse_select', ckpt.get('rmse', float('nan'))):.4f})")
             except Exception as e:
-                print(f"[24h] Warning: failed to load best checkpoint: {e}")
-        df24 = predict_per_county(ds_train, mdl24, scalers24, H24, ts24)
-        test_rmse_24 = per_county_rmse_mean(df_t24, df24)
-        print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
+                print(f"[{tag}] Warning: failed to load best checkpoint: {e}")
+        df_pred = predict_per_county(ds_train, model, scalers, H, ts_future)
+        rmse = per_county_rmse_mean(df_truth, df_pred)
+        print(f"[Test {tag}] RMSE={rmse:.4f} (all-zero RMSE={zero_rmse:.4f})")
 
-        zpnz_24, nzpz_24 = _zero_nonzero_ratios(df_t24, df24, eps=ZERO_EPS)
-        locs24 = [c for c in df_t24.columns if c != "timestamp"]
-        df_zero_long_24 = pd.DataFrame({
-            "timestamp": np.repeat(df_t24["timestamp"].values, len(locs24)),
-            "location": np.tile(locs24, len(df_t24)),
-            "pred": 0.0
-        })
-        zpnz_24_0, nzpz_24_0 = _zero_nonzero_ratios(df_t24, df_zero_long_24, eps=ZERO_EPS)
-        print(f"[Test 24h] Zero→Nonzero ratio={zpnz_24 if np.isfinite(zpnz_24) else float('nan'):.4f} "
-              f"(all-zero={zpnz_24_0 if np.isfinite(zpnz_24_0) else float('nan'):.4f}) | "
-              f"Nonzero→Zero ratio={nzpz_24 if np.isfinite(nzpz_24) else float('nan'):.4f} "
-              f"(all-zero={nzpz_24_0 if np.isfinite(nzpz_24_0) else float('nan'):.4f})")
-    else:
-        df24 = None
+        # diagnostics
+        zpnz, nzpz = _zero_nonzero_ratios(df_truth, df_pred, eps=ZERO_EPS)
+        locs = [c for c in df_truth.columns if c != "timestamp"]
+        df_zero_long = pd.DataFrame({"timestamp": np.repeat(df_truth['timestamp'].values, len(locs)),
+                                     "location": np.tile(locs, len(df_truth)),
+                                     "pred": 0.0})
+        zpnz0, nzpz0 = _zero_nonzero_ratios(df_truth, df_zero_long, eps=ZERO_EPS)
+        print(f"[Test {tag}] Zero→Nonzero={zpnz if np.isfinite(zpnz) else float('nan'):.4f} (all-zero={zpnz0 if np.isfinite(zpnz0) else float('nan'):.4f}) | "
+              f"Nonzero→Zero={nzpz if np.isfinite(nzpz) else float('nan'):.4f} (all-zero={nzpz0 if np.isfinite(nzpz0) else float('nan'):.4f})")
+        return df_pred
 
-    if mdl48 is not None:
-        best48_path = os.path.join(OUT_DIR, "best_enc-dec_48h.pt")
-        if os.path.exists(best48_path):
-            ckpt48 = torch.load(best48_path, map_location=DEVICE)
-            try:
-                mdl48.load_state_dict(ckpt48["model_state_dict"])
-                rmse48_val = ckpt48.get("rmse_select", ckpt48.get("rmse", None))
-                ep48 = ckpt48.get("epoch", None)
-                if isinstance(rmse48_val, (float, int)):
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val selected RMSE={rmse48_val:.4f}, best_by={ckpt48.get('best_by','overall')})")
-                else:
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48})")
-            except Exception as e:
-                print(f"[48h] Warning: failed to load best checkpoint: {e}")
-        df48 = predict_per_county(ds_train, mdl48, scalers48, H48, ts48)
-        test_rmse_48 = per_county_rmse_mean(df_t48, df48)
-        print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
-
-        zpnz_48, nzpz_48 = _zero_nonzero_ratios(df_t48, df48, eps=ZERO_EPS)
-        locs48 = [c for c in df_t48.columns if c != "timestamp"]
-        df_zero_long_48 = pd.DataFrame({
-            "timestamp": np.repeat(df_t48["timestamp"].values, len(locs48)),
-            "location": np.tile(locs48, len(df_t48)),
-            "pred": 0.0
-        })
-        zpnz_48_0, nzpz_48_0 = _zero_nonzero_ratios(df_t48, df_zero_long_48, eps=ZERO_EPS)
-        print(f"[Test 48h] Zero→Nonzero ratio={zpnz_48 if np.isfinite(zpnz_48) else float('nan'):.4f} "
-              f"(all-zero={zpnz_48_0 if np.isfinite(zpnz_48_0) else float('nan'):.4f}) | "
-              f"Nonzero→Zero ratio={nzpz_48 if np.isfinite(nzpz_48) else float('nan'):.4f} "
-              f"(all-zero={nzpz_48_0 if np.isfinite(nzpz_48_0) else float('nan'):.4f})")
-    else:
-        df48 = None
-
-    if df24 is None:
-        locs = list(map(str, ds_train.location.values))
-        df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
-                             "location": np.tile(locs, len(ts24)),
-                             "pred": 0.0})
-    if df48 is None:
-        locs = list(map(str, ds_train.location.values))
-        df48 = pd.DataFrame({"timestamp": np.repeat(ts48, len(locs)),
-                             "location": np.tile(locs, len(ts48)),
-                             "pred": 0.0})
+    df24 = _finalize(mdl24, scalers24, H24, ts24, df_t24, "24h", zero_rmse_24)
+    df48 = _finalize(mdl48, scalers48, H48, ts48, df_t48, "48h", zero_rmse_48)
 
     out24 = os.path.join(OUT_DIR, "stemgnn_pred_24h.csv")
     out48 = os.path.join(OUT_DIR, "stemgnn_pred_48h.csv")
-    df24.to_csv(out24, index=False)
-    df48.to_csv(out48, index=False)
-
-    print("Saved predictions:")
-    print(f"  {out24}")
-    print(f"  {out48}")
+    df24.to_csv(out24, index=False); df48.to_csv(out48, index=False)
+    print("Saved predictions:\n  ", out24, "\n  ", out48)
 
     ds_train.close(); ds_test24.close(); ds_test48.close()
 
