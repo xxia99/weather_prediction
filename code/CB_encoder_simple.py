@@ -12,7 +12,7 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_tcn_minimal"
+OUT_DIR   = "results_seq_tcn_minimal_keepval"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training
@@ -226,7 +226,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
     return X_tr, Y_tr, Din, scalers, aux
 
 # =======================================================
-# validation roll (unchanged logic)
+# validation roll (full pipeline preserved)
 # =======================================================
 @torch.no_grad()
 def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=TRAIN_LAST_DAY):
@@ -506,6 +506,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                 pred_path  = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
                 truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_day{int(d)}_{label}.csv")
                 pred_d.to_csv(pred_path, index=False); truth_d.to_csv(truth_path, index=False)
+                print(f"[Val {label}] Saved day {int(d)} prediction/truth data: {pred_path}, {truth_path}")
 
             if unique_days:
                 fig, axes = plt.subplots(len(unique_days), 1, figsize=(8, 3 * len(unique_days)), sharex=False)
@@ -519,8 +520,10 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                     ax.plot(merged["timestamp"], merged["pred"], label="Prediction")
                     ax.set_title(f"Day {int(d)}"); ax.set_xlabel("timestamp"); ax.set_ylabel("outage"); ax.legend()
                 fig.tight_layout()
-                fig.savefig(os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png"))
+                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
+                fig.savefig(fig_path)
                 plt.close(fig)
+                print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
 
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
@@ -574,7 +577,7 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     model = TCNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # ReduceLROnPlateau on training loss; best-on-val is handled by the callback checkpoint
+    # ReduceLROnPlateau on training loss
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
 
     # Optional SWA in the tail
@@ -663,7 +666,7 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     return pd.concat(rows, ignore_index=True)
 
 # =======================================================
-# main (unchanged outputs/plots)
+# main (pipeline preserved: plots, csvs, metrics)
 # =======================================================
 def main():
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
