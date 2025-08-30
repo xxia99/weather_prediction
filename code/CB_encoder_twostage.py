@@ -9,17 +9,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+# NEW: schedulers
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_mse_pre-CB_use-moe/two_stage_cls_blend"
+OUT_DIR   = "results_seq_mse_pre-CB_use-moe/two_stage_cls_blend_warmcos_ema"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ---- surge ranking csv from rank_surges.py (used if present) ----
 SURGE_CSV_PATH       = "results_surge/surge_ranking_mean.csv"
-USE_SURGE_RANK_CSV   = True  # if False or file missing → fallback to data-driven thresholds
+USE_SURGE_RANK_CSV   = True
 
 # ---- core training ----
 SEQ_LEN       = 24
@@ -29,7 +30,8 @@ LR            = 5e-4
 WEIGHT_DECAY  = 5e-5
 DEVICE        = "cuda:1" if torch.cuda.is_available() else "cpu"
 
-TEMPORAL_DROP_PROB = 0.0
+# NEW: tiny temporal mask
+TEMPORAL_DROP_PROB = 0.03
 
 # ---- PatchTST encoder ----
 PATCH_LEN      = 2
@@ -63,7 +65,7 @@ else:
 CB_ENCODER_CKPT = "results_lora/new/pretrained_cb_encoder_peft_independent_H24.pt"
 
 # ---- day split ----
-TRAIN_LAST_DAY = 80   # 1..80 train; day-ahead roll on 81..end
+TRAIN_LAST_DAY = 80
 
 # ---- event-stratified validation ----
 EVENT_METHOD   = "mean"
@@ -89,9 +91,7 @@ QUANTILES       = [0.1, 0.5, 0.9]
 PRED_QUANTILE   = 0.90
 
 # ======================== NEW: two-stage surge classifier ========================
-# Regimes and dynamic quantile weights (per regime)
 REGIME_NAMES = ["calm", "moderate", "storm"]
-#   [w(q=0.1), w(q=0.5), w(q=0.9)]
 REGIME_QWEIGHTS = {
     "calm":     np.array([0.50, 0.45, 0.05], dtype=np.float32),
     "moderate": np.array([0.20, 0.50, 0.30], dtype=np.float32),
@@ -105,6 +105,17 @@ CLS_WEIGHT_DECAY= 1e-5
 CLS_DROPOUT     = 0.10
 CLS_HIDDEN      = 128
 CLS_SAVE_PATH   = os.path.join(OUT_DIR, "day_surge_classifier.pt")
+# NEW: label smoothing
+CLS_LABEL_SMOOTH = 0.05
+
+# ======================== NEW: training stabilizers ========================
+# Cosine after warmup (fixes early-epoch plateau/overshoot)
+WARMUP_EPOCHS = 3
+MIN_LR        = 1e-5
+
+# EMA for evaluation (stabilizes validation curve)
+USE_EMA    = True
+EMA_DECAY  = 0.999
 
 # =======================================================
 # utils
@@ -160,11 +171,9 @@ class PatchTSTEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x: (B, T, N, F)
         B, T, N, F = x.shape
         P, S = self.patch_len, self.stride
         assert F == self.in_channels, f"PatchTST got F={F}, expected {self.in_channels}"
-
         x_bn = x.permute(0, 2, 1, 3).reshape(B * N, T, F)
         L = (T + S - 1) // S
         T_pad = (L - 1) * S + P
@@ -174,13 +183,11 @@ class PatchTSTEncoder(nn.Module):
         if T_pad > T:
             pad = torch.zeros(B * N, T_pad - T, F, device=x.device, dtype=x.dtype)
             x_bn = torch.cat([x_bn, pad], dim=1)
-        x_unf = x_bn.unfold(dimension=1, size=P, step=S)          # (B*N, L, P, F)
-        x_unf = x_unf.contiguous().view(B * N, L, P * F)          # (B*N, L, P*F)
-
+        x_unf = x_bn.unfold(dimension=1, size=P, step=S)
+        x_unf = x_unf.contiguous().view(B * N, L, P * F)
         tokens = self.proj(x_unf)
         tokens = self.dropout(tokens)
         tokens = self.encoder(tokens)
-
         tokens_rep = tokens.repeat_interleave(P, dim=1)
         steps = tokens_rep[:, :T, :]
         h = steps.view(B, N, T, self.d_model).permute(0, 2, 1, 3)
@@ -221,7 +228,6 @@ class ChronosBoltEncoderPEFT(nn.Module):
         d_out         = int(ck.get("d_out", 64))
         self.in_channels = int(ck.get("in_channels", in_channels))
         self.d_model = d_out
-
         try:
             from transformers import AutoModel, AutoConfig
             from peft import LoraConfig, get_peft_model
@@ -230,7 +236,6 @@ class ChronosBoltEncoderPEFT(nn.Module):
                 "Install deps: pip install transformers peft accelerate safetensors\n"
                 f"Original import error: {e}"
             )
-
         config  = AutoConfig.from_pretrained(cb_model_name, trust_remote_code=True)
         backbone = AutoModel.from_pretrained(cb_model_name, trust_remote_code=True, output_hidden_states=True)
         lcfg = LoraConfig(
@@ -243,13 +248,11 @@ class ChronosBoltEncoderPEFT(nn.Module):
         )
         from peft import get_peft_model
         backbone = get_peft_model(backbone, lcfg)
-
         hidden_dim = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
         if hidden_dim is None:
             raise RuntimeError("Cannot determine Chronos hidden size from config.")
         self.embed_proj = nn.Linear(self.in_channels, hidden_dim)
         self.post_proj  = nn.Linear(hidden_dim, self.d_model)
-
         self.backbone = backbone
         self.load_state_dict(ck["state_dict"], strict=True)
         print(f"[CB Encoder] Loaded PEFT encoder from: {ckpt_path} | d_out={self.d_model}")
@@ -373,7 +376,7 @@ class MoEReadout(nn.Module):
         else:
             topi = torch.arange(self.num_experts, device=h_last.device).view(1,1,self.num_experts).expand(B,N,self.num_experts)
             topw = probs
-        expert_outs = torch.stack([exp(h_last) for exp in self.experts], dim=-1)   # (B,N,OUT,E)
+        expert_outs = torch.stack([exp(h_last) for exp in self.experts], dim=-1)
         gather_idx = topi.unsqueeze(-2).expand(B, N, expert_outs.size(-2), topw.size(-1))
         selected = expert_outs.gather(dim=-1, index=gather_idx)
         y = (selected * topw.unsqueeze(-2)).sum(dim=-1)
@@ -470,26 +473,20 @@ class STGNNForecaster(nn.Module):
             y_flat = self.readout(last)
             self._last_aux_loss = None
             self._last_gate_mean = None
-
         if USE_QUANTILES:
             y = y_flat.view(B, N, self.horizon, len(QUANTILES))
             return y
         else:
             return y_flat
-
     def moe_aux_loss(self):
         return self._last_aux_loss
     def moe_gate_usage(self):
         return self._last_gate_mean
 
 # =======================================================
-# NEW: Day-ahead surge classifier (calm/moderate/storm)
+# Day-ahead surge classifier
 # =======================================================
 class DaySurgeClassifier(nn.Module):
-    """
-    Input: (B, T, D) aggregated across locations for the last T=SEQ_LEN hours of day d
-    Output: logits over 3 classes for day d+1 (calm, moderate, storm)
-    """
     def __init__(self, d_in, hidden=CLS_HIDDEN, dropout=CLS_DROPOUT, n_classes=3):
         super().__init__()
         self.temporal = nn.Sequential(
@@ -498,7 +495,7 @@ class DaySurgeClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.AdaptiveAvgPool1d(1)  # global avg over time
+            nn.AdaptiveAvgPool1d(1)
         )
         self.head = nn.Sequential(
             nn.Flatten(),
@@ -507,12 +504,10 @@ class DaySurgeClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, n_classes)
         )
-
     def forward(self, x):
-        # x: (B, T, D) -> conv needs (B, D, T)
         x = x.permute(0, 2, 1)
-        h = self.temporal(x)   # (B, hidden, 1)
-        logits = self.head(h)  # (B, 3)
+        h = self.temporal(x)
+        logits = self.head(h)
         return logits
 
 # =======================================================
@@ -541,12 +536,9 @@ def _fit_scalers_train_only(y, w, days, train_last_day):
     return {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
 
 # =======================================================
-# NEW: labels for surge classifier
+# labels for surge classifier
 # =======================================================
 def _levels_from_csv(csv_path, max_day):
-    """
-    Returns dict: day_index -> label_id (0=calm,1=moderate,2=storm)
-    """
     if not (USE_SURGE_RANK_CSV and os.path.exists(csv_path)):
         return None
     df = pd.read_csv(csv_path)
@@ -559,23 +551,19 @@ def _levels_from_csv(csv_path, max_day):
             return 0
         if s == "moderate":
             return 1
-        if s in ("severe", "extreme"):
+        if s in ("severe", "extreme", "storm"):
             return 2
-        # fallback
         return 1
     df["label"] = df["level"].map(map_level)
     return {int(r.day_index): int(r.label) for r in df.itertuples(index=False)}
 
 def _levels_from_data(ds_train):
-    """
-    Fallback: derive labels from day_max distribution quantiles.
-    """
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)  # (T,N)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     ts = ds_train.timestamp.values
     days, uniq, _ = _compute_day_indices(ts)
     per_day = []
     for i, dts in enumerate(uniq, start=1):
-        x = y[days == i].mean(axis=1)  # mean across locations per hour
+        x = y[days == i].mean(axis=1)
         per_day.append([i, float(np.nanmax(x))])
     df = pd.DataFrame(per_day, columns=["day_index", "day_max"])
     q = df["day_max"].quantile([0.25, 0.75]).values
@@ -591,40 +579,29 @@ def _levels_from_data(ds_train):
     return labels
 
 # =======================================================
-# NEW: build day-level classifier dataset
+# build day-level classifier dataset
 # =======================================================
 def build_day_cls_dataset(ds_train, scalers, seq_len=SEQ_LEN, train_last_day=TRAIN_LAST_DAY):
-    """
-    X_cls: (num_days_train-1, T=SEQ_LEN, Din_agg) aggregated across locations
-    y_cls: (num_days_train-1,) label for day d+1
-    """
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
     T, N, F = w.shape
     Din = 1 + F
-
-    # scale
-    y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)       # (T, N)
-    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)    # (T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                               # (T, N, Din)
-
-    # load labels
+    y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
+    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
     lab_map = _levels_from_csv(SURGE_CSV_PATH, max_day=int(days.max()))
     if lab_map is None:
         lab_map = _levels_from_data(ds_train)
-
-    # make samples: context = last SEQ_LEN hours of day d, label = level of day d+1
     X_list, y_list, d_src = [], [], []
-    for d in range(1, train_last_day):  # last usable context is day train_last_day (predict day+1)
+    for d in range(1, train_last_day):
         if (d+1) not in lab_map:
             continue
         end_idx = day_end_idx[d - 1]
         start_ctx = end_idx - (seq_len - 1)
         if start_ctx < 0:
             continue
-        # aggregate across locations (mean)
         x_ctx = X_all[start_ctx:end_idx+1].mean(axis=1)  # (SEQ_LEN, Din)
         X_list.append(x_ctx.astype(np.float32))
         y_list.append(int(lab_map[d+1]))
@@ -636,18 +613,20 @@ def build_day_cls_dataset(ds_train, scalers, seq_len=SEQ_LEN, train_last_day=TRA
     return X_cls, y_cls, Din, {"days": d_src, "lab_map": lab_map}
 
 # =======================================================
-# NEW: train classifier
+# train classifier  (NEW: label_smoothing)
 # =======================================================
 def train_day_classifier(X_cls, y_cls, Din_agg):
     cls = DaySurgeClassifier(d_in=Din_agg).to(DEVICE)
     ds = TensorDataset(torch.tensor(X_cls, dtype=torch.float32), torch.tensor(y_cls, dtype=torch.long))
     dl = DataLoader(ds, batch_size=64, shuffle=True)
-    # class weights (inverse freq)
     uniq, counts = np.unique(y_cls, return_counts=True)
     cw = np.zeros(3, dtype=np.float32) + 1.0
     for u, c in zip(uniq, counts):
         cw[int(u)] = float(len(y_cls) / (3.0 * max(1, c)))
-    ce = nn.CrossEntropyLoss(weight=torch.tensor(cw, device=DEVICE, dtype=torch.float32))
+    ce = nn.CrossEntropyLoss(
+        weight=torch.tensor(cw, device=DEVICE, dtype=torch.float32),
+        label_smoothing=CLS_LABEL_SMOOTH  # NEW
+    )
     opt = torch.optim.Adam(cls.parameters(), lr=CLS_LR, weight_decay=CLS_WEIGHT_DECAY)
 
     for ep in range(CLS_EPOCHS):
@@ -673,10 +652,6 @@ def train_day_classifier(X_cls, y_cls, Din_agg):
 
 @torch.no_grad()
 def classify_day(cls_model, x_ctx_agg):
-    """
-    x_ctx_agg: (1, SEQ_LEN, Din_agg)
-    returns probs (3,)
-    """
     cls_model.eval()
     xb = torch.tensor(x_ctx_agg, dtype=torch.float32, device=DEVICE)
     logits = cls_model(xb)  # (1,3)
@@ -684,10 +659,6 @@ def classify_day(cls_model, x_ctx_agg):
     return probs  # [p_calm, p_moderate, p_storm]
 
 def blend_quantile_weights(probs):
-    """
-    probs: [p_calm, p_moderate, p_storm]
-    return qw: (Q,)
-    """
     w_calm = REGIME_QWEIGHTS["calm"]
     w_mod  = REGIME_QWEIGHTS["moderate"]
     w_stm  = REGIME_QWEIGHTS["storm"]
@@ -699,33 +670,28 @@ def blend_quantile_weights(probs):
 # training split for forecaster
 # =======================================================
 def prepare_training_split(ds_train, horizon, train_last_day=80):
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
     T, N, F = w.shape
     Din = 1 + F
-
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
-
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                               # (T, N, Din)
-
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
     N_total = T - SEQ_LEN - horizon + 1
     if N_total <= 0:
         raise RuntimeError("Not enough history for the given SEQ_LEN and horizon.")
     day_last_idx = day_end_idx[train_last_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
-
     X_list, Y_list = [], []
     for node in range(N):
         x_loc_full = X_all[:, node, :]
         Xw, Yw = build_windows(x_loc_full, y_sc[:, node], SEQ_LEN, horizon)
         if len(Xw):
-            X_list.append(Xw[:N_train][:, :, None, :])  # (nW, SEQ_LEN, 1, Din)
-            Y_list.append(Yw[:N_train][:, None, :])     # (nW, 1, H)
-
+            X_list.append(Xw[:N_train][:, :, None, :])
+            Y_list.append(Yw[:N_train][:, None, :])
     if not X_list:
         raise RuntimeError("No training windows after split; check SEQ_LEN/horizon/TRAIN_LAST_DAY.")
     X_tr = np.concatenate(X_list, axis=0)
@@ -744,20 +710,13 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
 # =======================================================
 @torch.no_grad()
 def predict_val_roll(ds_train, model, cls_model, scalers, horizon, aux, train_last_day=80):
-    """
-    For each day d in [train_last_day, last_day-1]:
-      1) build day-context from day d (last SEQ_LEN hours, aggregated over locations)
-      2) classify day d+1 regime -> probs -> quantile weights
-      3) forecast per county for day d+1 using blended quantiles
-    """
     model.eval()
-    X_all = aux["X_all_scaled"]           # (T, N, Din)
+    X_all = aux["X_all_scaled"]
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
     N = X_all.shape[1]
     locs = list(map(str, ds_train.location.values))
-
     rows = []
     last_day = int(days.max())
     for d in range(train_last_day, last_day):
@@ -767,32 +726,23 @@ def predict_val_roll(ds_train, model, cls_model, scalers, horizon, aux, train_la
         fut_end   = fut_start + horizon - 1
         if start_ctx < 0 or fut_end >= len(ts):
             continue
-
         ts_future = pd.to_datetime(ts[fut_start:fut_start+horizon])
-
-        # --- classifier: aggregate across locations for context ---
-        ctx_agg = X_all[start_ctx:end_idx+1].mean(axis=1)     # (SEQ_LEN, Din)
-        probs = classify_day(cls_model, ctx_agg[None, ...])   # (3,)
-        qw = blend_quantile_weights(probs)                    # (Q,)
-
-        # --- per-county quantile forecast & blend ---
+        ctx_agg = X_all[start_ctx:end_idx+1].mean(axis=1)
+        probs = classify_day(cls_model, ctx_agg[None, ...])
+        qw = blend_quantile_weights(probs)
         for i, county in enumerate(locs):
-            Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, X_all.shape[2])  # (1,SEQ_LEN,1,Din)
+            Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, X_all.shape[2])
             yq_sc = infer_quantiles(model, Xin_i)[0, 0]  # (H, Q)
-            # blend to point
-            pred_sc = (yq_sc * qw[None, :]).sum(axis=1)  # (H,)
-
+            pred_sc = (yq_sc * qw[None, :]).sum(axis=1)
             y_mu = float(scalers["y_mu"].flatten()[0])
             y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
             pred = (pred_sc * y_sd) + y_mu
             pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
-
             rows.append(pd.DataFrame({
                 "timestamp": ts_future,
                 "location": county,
                 "pred": pred.astype(float)
             }))
-
     df_pred = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["timestamp", "location", "pred"])
     return df_pred
 
@@ -800,7 +750,6 @@ def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
     ts    = aux["timestamps"]
     days  = aux["days"]
     day_end_idx = aux["day_end_idx"]
-
     fut_indices = []
     last_day = int(days.max())
     for d in range(train_last_day, last_day):
@@ -811,10 +760,8 @@ def truth_wide_for_val(ds_train, aux, horizon, train_last_day=80):
             fut_indices.extend(list(range(fut_start, fut_start + horizon)))
     if not fut_indices:
         return pd.DataFrame(columns=["timestamp"])
-
     fut_indices = sorted(set(fut_indices))
     ts_fut = pd.to_datetime(ts[fut_indices])
-
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     locs = list(map(str, ds_train.location.values))
     df = pd.DataFrame(y[fut_indices, :], columns=locs, index=ts_fut).reset_index().rename(columns={"index": "timestamp"})
@@ -839,34 +786,27 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce").astype("datetime64[ns]")
     df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
     tw = df_t.set_index("timestamp").sort_index()
-
     df_p = df_pred_long.copy()
     df_p["timestamp"] = pd.to_datetime(df_p["timestamp"], errors="coerce").astype("datetime64[ns]")
     df_p["location"]  = df_p["location"].astype(str)
     df_p = df_p.dropna(subset=["timestamp", "location"])
     df_p = df_p.groupby(["timestamp", "location"], as_index=False, sort=False)["pred"].mean()
     pw = df_p.pivot_table(index="timestamp", columns="location", values="pred", aggfunc="mean").sort_index()
-
     common_ts = tw.index.intersection(pw.index)
     if len(common_ts) == 0:
         return float("nan"), float("nan")
     tw = tw.loc[common_ts]
     pw = pw.loc[common_ts]
-
     locs = sorted(set(tw.columns).intersection(pw.columns))
     if len(locs) == 0:
         return float("nan"), float("nan")
-
     y_true = tw[locs].to_numpy()
     y_pred = pw[locs].to_numpy()
-
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     if not np.any(valid):
         return float("nan"), float("nan")
-
     y_true = y_true[valid]
     y_pred = y_pred[valid]
-
     true_zero = (np.abs(y_true) <= eps)
     pred_zero = (np.abs(y_pred) <= eps)
     denom_zero = np.sum(true_zero)
@@ -875,9 +815,6 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     nz_to_z = np.sum((~true_zero) & pred_zero) / denom_nz if denom_nz > 0 else float("nan")
     return float(z_to_nz), float(nz_to_z)
 
-# =======================================================
-# event blocks, callbacks (unchanged except dynamic blending)
-# =======================================================
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
     days, _, _ = _compute_day_indices(ts)
@@ -913,7 +850,6 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
                        train_last_day, method, storm_top_q, calm_bottom_q, calm_n, seed):
     rmse_overall = per_county_rmse_mean(df_truth_val, df_pred_val) if (not df_truth_val.empty and not df_pred_val.empty) else float("nan")
     zero_overall = _all_zero_rmse_for_truth(df_truth_val) if not df_truth_val.empty else float("nan")
-
     rng = np.random.default_rng(seed)
     ts = ds_train.timestamp.values
     days, day_score = _per_day_outage_score(ds_train, method=method)
@@ -921,11 +857,9 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
     tgt_days = np.arange(train_last_day + 1, last_day + 1, dtype=int)
     if len(tgt_days) == 0:
         return rmse_overall, zero_overall, float("nan"), float("nan"), 0, float("nan"), float("nan"), 0
-
     tgt_scores = day_score[tgt_days - 1]
     storm_thr = np.quantile(tgt_scores, storm_top_q)
     calm_thr  = np.quantile(tgt_scores, calm_bottom_q)
-
     storm_days = set(tgt_days[tgt_scores >= storm_thr].tolist())
     calm_pool  = tgt_days[tgt_scores <= calm_thr].tolist()
     if len(calm_pool) > 0:
@@ -933,10 +867,8 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
         calm_days = set(rng.choice(calm_pool, size=k, replace=False).tolist())
     else:
         calm_days = set()
-
     ts_storm = _timestamps_for_days(ts, storm_days)
     ts_calm  = _timestamps_for_days(ts, calm_days)
-
     if len(ts_calm) > 0:
         truth_calm, pred_calm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_calm)
         rmse_calm = per_county_rmse_mean(truth_calm, pred_calm)
@@ -944,7 +876,6 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
         n_calm = len(calm_days)
     else:
         rmse_calm, zero_calm, n_calm = float("nan"), float("nan"), 0
-
     if len(ts_storm) > 0:
         truth_storm, pred_storm = _filter_truth_pred_by_days(df_truth_val, df_pred_val, ts_storm)
         rmse_storm = per_county_rmse_mean(truth_storm, pred_storm)
@@ -952,7 +883,6 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
         n_storm = len(storm_days)
     else:
         rmse_storm, zero_storm, n_storm = float("nan"), float("nan"), 0
-
     return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
 
 def make_val_callback_rolling(ds_train, cls_model, scalers, horizon, aux, label,
@@ -960,10 +890,8 @@ def make_val_callback_rolling(ds_train, cls_model, scalers, horizon, aux, label,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
     best = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
-
     def _callback(model, epoch):
         df_pred_val = predict_val_roll(ds_train, model, cls_model, scalers, horizon, aux, train_last_day)
-
         (rmse_overall, zero_overall,
          rmse_calm, zero_calm, n_calm,
          rmse_storm, zero_storm, n_storm) = _event_rmse_blocks(
@@ -975,7 +903,6 @@ def make_val_callback_rolling(ds_train, cls_model, scalers, horizon, aux, label,
             calm_n=CALM_N,
             seed=42
         )
-
         zpnz_model, nzpz_model = _zero_nonzero_ratios(df_truth_val, df_pred_val, eps=ZERO_EPS)
         if not df_truth_val.empty:
             locs = [c for c in df_truth_val.columns if c != "timestamp"]
@@ -1031,110 +958,68 @@ def make_val_callback_rolling(ds_train, cls_model, scalers, horizon, aux, label,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-            ts_map = pd.DataFrame({
-                "timestamp": pd.to_datetime(aux["timestamps"]),
-                "day": aux["days"]
-            })
-            df_pred_day = df_pred_val.merge(ts_map, on="timestamp", how="left")
-            df_truth_day = df_truth_val.merge(ts_map, on="timestamp", how="left")
-
-            unique_days = sorted(df_pred_day["day"].dropna().unique())
-            for d in unique_days:
-                pred_d = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
-                truth_d = df_truth_day[df_truth_day["day"] == d].drop(columns="day")
-                pred_path = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
-                truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_day{int(d)}_{label}.csv")
-                pred_d.to_csv(pred_path, index=False)
-                truth_d.to_csv(truth_path, index=False)
-                print(f"[Val {label}] Saved day {int(d)} prediction/truth data: {pred_path}, {truth_path}")
-
-            if unique_days:
-                fig, axes = plt.subplots(len(unique_days), 1, figsize=(8, 3 * len(unique_days)), sharex=False)
-                if len(unique_days) == 1:
-                    axes = [axes]
-                for ax, d in zip(axes, unique_days):
-                    truth_d = df_truth_day[df_truth_day["day"] == d].set_index("timestamp").drop(columns="day")
-                    truth_mean = truth_d.mean(axis=1).reset_index(name="truth")
-                    pred_mean = (
-                        df_pred_day[df_pred_day["day"] == d]
-                        .groupby("timestamp")["pred"].mean().reset_index()
-                    )
-                    merged = pd.merge(truth_mean, pred_mean, on="timestamp", how="inner").sort_values("timestamp")
-                    ax.plot(merged["timestamp"], merged["truth"], label="Truth")
-                    ax.plot(merged["timestamp"], merged["pred"], label="Prediction")
-                    ax.set_title(f"Day {int(d)}")
-                    ax.set_xlabel("timestamp")
-                    ax.set_ylabel("outage")
-                    ax.legend()
-                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
-                fig.tight_layout()
-                fig.savefig(fig_path)
-                plt.close(fig)
-                print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
-
-        if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
-            df_pred_test = predict_per_county(ds_train, model, cls_model, scalers, horizon, ts_future_test)
-            rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
-
-            zpnz_t, nzpz_t = _zero_nonzero_ratios(df_truth_test, df_pred_test, eps=ZERO_EPS)
-            locs_t = [c for c in df_truth_test.columns if c != "timestamp"]
-            df_zero_long_t = pd.DataFrame({
-                "timestamp": np.repeat(df_truth_test["timestamp"].values, len(locs_t)),
-                "location": np.tile(locs_t, len(df_truth_test)),
-                "pred": 0.0
-            })
-            zpnz_t0, nzpz_t0 = _zero_nonzero_ratios(df_truth_test, df_zero_long_t, eps=ZERO_EPS)
-
-            print(f"[Val {label}] Epoch {epoch}: Testing RMSE={rmse_test:.4f} (all-zero RMSE={zero_rmse_test:.4f})")
-            print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
-                  f"(all-zero={zpnz_t0 if np.isfinite(zpnz_t0) else float('nan'):.4f}) | "
-                  f"Nonzero→Zero={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
-                  f"(all-zero={nzpz_t0 if np.isfinite(nzpz_t0) else float('nan'):.4f})")
-
     return _callback
 
 # =======================================================
-# NEW: quantile-aware inference helpers
+# quantile-aware inference helpers
 # =======================================================
 @torch.no_grad()
 def infer_quantiles(model, Xin):
-    """
-    Xin: (1, SEQ_LEN, N, F)
-    Returns: (1, N, H, Q) quantiles (scaled space)
-    """
     model.eval()
     out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
     if USE_QUANTILES:
         return out.cpu().numpy()
     else:
-        # if not quantile model, fake Q dim with single median
         y = out.cpu().numpy()
         return y[..., None]
 
 @torch.no_grad()
 def infer_point_with_blend(model, Xin, qw, pred_quantile=PRED_QUANTILE):
-    """
-    If quantiles are available, blend by qw; else fall back to chosen quantile.
-    Xin: (1, SEQ_LEN, N, F); qw: (Q,)
-    """
     yq = infer_quantiles(model, Xin)  # (1,N,H,Q)
     if yq.shape[-1] >= 2:
         qw = np.asarray(qw, dtype=np.float32)
         qw = qw / max(qw.sum(), 1e-8)
-        y = (yq * qw.reshape(1,1,1,-1)).sum(axis=-1)  # (1,N,H)
+        y = (yq * qw.reshape(1,1,1,-1)).sum(axis=-1)
     else:
-        # fallback: pick closest quantile or identity
         y = yq[..., 0]
     return y
 
 # =======================================================
-# training / inference for forecaster (uses pinball loss)
+# training / inference for forecaster (pinball)
 # =======================================================
 def _pinball_loss(yq, y_true, q_list):
-    qs = torch.tensor(q_list, device=yq.device, dtype=yq.dtype).view(1,1,1,-1)  # (1,1,1,Q)
-    diff = y_true.unsqueeze(-1) - yq                                           # (B,N,H,Q)
+    qs = torch.tensor(q_list, device=yq.device, dtype=yq.dtype).view(1,1,1,-1)
+    diff = y_true.unsqueeze(-1) - yq
     loss = torch.maximum(qs * diff, (qs - 1.0) * diff)
     return loss.mean()
+
+# NEW: simple EMA utility
+class _EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = p.data.clone()
+        self.backup = {}
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+    @torch.no_grad()
+    def swap_to_shadow(self, model: nn.Module):
+        self.backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n])
+    @torch.no_grad()
+    def swap_back(self, model: nn.Module):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = {}
 
 def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     if len(X) == 0:
@@ -1158,6 +1043,19 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             ],
             weight_decay=WEIGHT_DECAY
         )
+
+    # NEW: LR schedule = warmup -> cosine
+    sched = SequentialLR(
+        opt,
+        schedulers=[
+            LinearLR(opt, start_factor=0.1, total_iters=WARMUP_EPOCHS),
+            CosineAnnealingLR(opt, T_max=max(1, EPOCHS - WARMUP_EPOCHS), eta_min=MIN_LR),
+        ],
+        milestones=[WARMUP_EPOCHS]
+    )
+
+    # NEW: EMA
+    ema = _EMA(model, decay=EMA_DECAY) if USE_EMA else None
 
     loss_fn_point = nn.MSELoss()
 
@@ -1187,6 +1085,11 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
+
+            # NEW: update EMA each step
+            if ema is not None:
+                ema.update(model)
+
             epoch_loss += loss.item() * xb.size(0)
 
         epoch_loss /= len(dl.dataset)
@@ -1201,8 +1104,17 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
         else:
             print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s | LR: {lr_str}")
 
+        # NEW: evaluate with EMA weights swapped in
         if eval_callback is not None:
-            eval_callback(model, epoch + 1)
+            if ema is not None:
+                ema.swap_to_shadow(model)
+                eval_callback(model, epoch + 1)
+                ema.swap_back(model)
+            else:
+                eval_callback(model, epoch + 1)
+
+        # NEW: step scheduler per epoch
+        sched.step()
 
     return model
 
@@ -1210,70 +1122,38 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
 # test-time prediction (dynamic blending using classifier)
 # =======================================================
 def predict_per_county(ds_train, model, cls_model, scalers, horizon, ts_future):
-    """
-    Predict next 'horizon' for ALL counties, running the model per-county (N=1),
-    and forming point forecast by classifier-driven quantile blending using the
-    context from the LAST train day (day TRAIN_LAST_DAY).
-    """
     locs = list(map(str, ds_train.location.values))
-    y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    y = ds_train.out.transpose("timestamp", "location").values.astype(float)
+    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, _, day_end_idx = _compute_day_indices(ts)
-
     T, N, F = w.shape
     Din = 1 + F
-
-    # scale inputs
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)   # (T, N, Din)
-
-    # classifier context from the last train day
+    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
     end_idx = day_end_idx[TRAIN_LAST_DAY - 1]
-    start_ctx = end_idx - (SEQ_LEN - 1)
-    if start_ctx < 0:
-        start_ctx = 0
-    ctx_agg = X_all[start_ctx:end_idx+1].mean(axis=1)         # (SEQ_LEN, Din)
+    start_ctx = max(0, end_idx - (SEQ_LEN - 1))
+    ctx_agg = X_all[start_ctx:end_idx+1].mean(axis=1)
     probs = classify_day(cls_model, ctx_agg[None, ...])
     qw = blend_quantile_weights(probs)
-
     rows = []
     for i, county in enumerate(locs):
         if T < SEQ_LEN:
             pred_sc = np.zeros(horizon, dtype=float)
         else:
-            Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)  # (1, SEQ_LEN, 1, Din)
-            yq_sc = infer_quantiles(model, Xin_i)[0, 0]                 # (H, Q)
-            pred_sc = (yq_sc * qw[None, :]).sum(axis=1)                 # (H,)
-
+            Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
+            yq_sc = infer_quantiles(model, Xin_i)[0, 0]
+            pred_sc = (yq_sc * qw[None, :]).sum(axis=1)
         pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
         pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
         rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
     return pd.concat(rows, ignore_index=True)
 
 # =======================================================
-# simple eval callback (kept for completeness; not used by main)
-# =======================================================
-def make_eval_callback(ds_train, cls_model, scalers, horizon, ts_future, df_truth, label):
-    best = {"rmse": float("inf"), "epoch": -1}
-    def _callback(model, epoch):
-        df_pred = predict_per_county(ds_train, model, cls_model, scalers, horizon, ts_future)
-        rmse = per_county_rmse_mean(df_truth, df_pred)
-        print(f"[Eval {label}] Epoch {epoch}: RMSE={rmse:.4f}")
-        if np.isfinite(rmse) and rmse < best["rmse"]:
-            best["rmse"] = rmse
-            best["epoch"] = epoch
-            save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
-            torch.save({"epoch": epoch, "label": label, "rmse": rmse, "model_state_dict": model.state_dict()}, save_path)
-            print(f"[Eval {label}] New best RMSE {rmse:.4f} at epoch {epoch}. Saved: {save_path}")
-    return _callback
-
-# =======================================================
 # main
 # =======================================================
 def main():
-    # Load train + test
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
     ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
@@ -1319,77 +1199,15 @@ def main():
     mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
 
     # ----- Test evaluation using best models, then write CSVs -----
-    # 24h
     if mdl24 is not None:
-        best24_path = os.path.join(OUT_DIR, "best_enc-dec_24h.pt")
-        if os.path.exists(best24_path):
-            ckpt24 = torch.load(best24_path, map_location=DEVICE)
-            try:
-                mdl24.load_state_dict(ckpt24["model_state_dict"])
-                rmse24_val = ckpt24.get("rmse_select", ckpt24.get("rmse", None))
-                ep24 = ckpt24.get("epoch", None)
-                if isinstance(rmse24_val, (float, int)):
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24}, Val selected RMSE={rmse24_val:.4f}, best_by={ckpt24.get('best_by','overall')})")
-                else:
-                    print(f"[24h] Loaded best checkpoint (epoch {ep24})")
-            except Exception as e:
-                print(f"[24h] Warning: failed to load best checkpoint: {e}")
         df24 = predict_per_county(ds_train, mdl24, cls_model, scalers24, H24, ts24)
-        test_rmse_24 = per_county_rmse_mean(df_t24, df24)
-        print(f"[Test 24h] Testing RMSE={test_rmse_24:.4f} (all-zero RMSE={zero_rmse_24:.4f})")
-
-        # final test ratios for 24h
-        zpnz_24, nzpz_24 = _zero_nonzero_ratios(df_t24, df24, eps=ZERO_EPS)
-        locs24 = [c for c in df_t24.columns if c != "timestamp"]
-        df_zero_long_24 = pd.DataFrame({
-            "timestamp": np.repeat(df_t24["timestamp"].values, len(locs24)),
-            "location": np.tile(locs24, len(df_t24)),
-            "pred": 0.0
-        })
-        zpnz_24_0, nzpz_24_0 = _zero_nonzero_ratios(df_t24, df_zero_long_24, eps=ZERO_EPS)
-        print(f"[Test 24h] Zero→Nonzero={zpnz_24 if np.isfinite(zpnz_24) else float('nan'):.4f} "
-              f"(all-zero={zpnz_24_0 if np.isfinite(zpnz_24_0) else float('nan'):.4f}) | "
-              f"Nonzero→Zero={nzpz_24 if np.isfinite(nzpz_24) else float('nan'):.4f} "
-              f"(all-zero={nzpz_24_0 if np.isfinite(nzpz_24_0) else float('nan'):.4f})")
     else:
         df24 = None
-
-    # 48h
     if mdl48 is not None:
-        best48_path = os.path.join(OUT_DIR, "best_enc-dec_48h.pt")
-        if os.path.exists(best48_path):
-            ckpt48 = torch.load(best48_path, map_location=DEVICE)
-            try:
-                mdl48.load_state_dict(ckpt48["model_state_dict"])
-                rmse48_val = ckpt48.get("rmse_select", ckpt48.get("rmse", None))
-                ep48 = ckpt48.get("epoch", None)
-                if isinstance(rmse48_val, (float, int)):
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48}, Val selected RMSE={rmse48_val:.4f}, best_by={ckpt48.get('best_by','overall')})")
-                else:
-                    print(f"[48h] Loaded best checkpoint (epoch {ep48})")
-            except Exception as e:
-                print(f"[48h] Warning: failed to load best checkpoint: {e}")
         df48 = predict_per_county(ds_train, mdl48, cls_model, scalers48, H48, ts48)
-        test_rmse_48 = per_county_rmse_mean(df_t48, df48)
-        print(f"[Test 48h] Testing RMSE={test_rmse_48:.4f} (all-zero RMSE={zero_rmse_48:.4f})")
-
-        # final test ratios for 48h
-        zpnz_48, nzpz_48 = _zero_nonzero_ratios(df_t48, df48, eps=ZERO_EPS)
-        locs48 = [c for c in df_t48.columns if c != "timestamp"]
-        df_zero_long_48 = pd.DataFrame({
-            "timestamp": np.repeat(df_t48["timestamp"].values, len(locs48)),
-            "location": np.tile(locs48, len(df_t48)),
-            "pred": 0.0
-        })
-        zpnz_48_0, nzpz_48_0 = _zero_nonzero_ratios(df_t48, df_zero_long_48, eps=ZERO_EPS)
-        print(f"[Test 48h] Zero→Nonzero={zpnz_48 if np.isfinite(zpnz_48) else float('nan'):.4f} "
-              f"(all-zero={zpnz_48_0 if np.isfinite(zpnz_48_0) else float('nan'):.4f}) | "
-              f"Nonzero→Zero={nzpz_48 if np.isfinite(nzpz_48) else float('nan'):.4f} "
-              f"(all-zero={nzpz_48_0 if np.isfinite(nzpz_48_0) else float('nan'):.4f})")
     else:
         df48 = None
 
-    # Fallbacks
     if df24 is None:
         locs = list(map(str, ds_train.location.values))
         df24 = pd.DataFrame({"timestamp": np.repeat(ts24, len(locs)),
