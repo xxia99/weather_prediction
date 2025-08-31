@@ -13,7 +13,7 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_tcn_minimal_keepval_zinb"
+OUT_DIR   = "results_seq_tcn_minimal_keepval_zinb/fix_gpu"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training
@@ -112,6 +112,39 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
         Xw.append(X_loc[i:i+seq_len])
         Yw.append(y_loc[i+seq_len:i+seq_len+horizon])
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
+
+def _update_bn_on_device(loader, model, device):
+    """Like torch.optim.swa_utils.update_bn, but moves inputs to the target device."""
+    if not any(m.training for m in model.modules()):
+        model.train()  # ensure BN runs in training mode
+
+    momenta = {}
+    model.apply(lambda module: momenta.setdefault(module, getattr(module, 'momentum', None))
+                if isinstance(module, nn.modules.batchnorm._BatchNorm) else None)
+
+    # Reset running stats
+    for module in momenta.keys():
+        module.running_mean.zero_()
+        module.running_var.fill_(1)
+        # PyTorch's update_bn sets momentum dynamically per-batch; we’ll do the same.
+
+    n = 0
+    for batch in loader:
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        b = x.size(0)
+        momentum = b / float(n + b)
+        # temporarily set BN momentum for this pass
+        for module in momenta.keys():
+            module.momentum = momentum
+        with torch.no_grad():
+            x = x.to(device, non_blocking=True)
+            model(x)
+        n += b
+
+    # restore original BN momenta
+    for module, mom in momenta.items():
+        module.momentum = mom
+
 
 # =======================================================
 # TCN forecaster (minimal backbone) + dual heads
@@ -863,9 +896,8 @@ def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, 
             eval_callback(model if not USE_SWA or epoch < swa_start else swa_model, epoch + 1)
 
     if USE_SWA:
-        from torch.optim.swa_utils import update_bn
-        # recompute BN stats on (possibly augmented) data
-        update_bn(dl, swa_model)
+        # recompute BN stats using device-aware refresh to avoid CPU/GPU mismatch
+        _update_bn_on_device(dl, swa_model, DEVICE)
         return swa_model
     return model
 
