@@ -6,13 +6,14 @@ import pandas as pd
 import xarray as xr
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_tcn_minimal_keepval"
+OUT_DIR   = "results_seq_tcn_minimal_keepval_zinb"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training
@@ -22,6 +23,7 @@ EPOCHS        = 40
 LR            = 8e-4
 WEIGHT_DECAY  = 1e-4
 DEVICE        = "cuda:0" if torch.cuda.is_available() else "cpu"
+MAX_GRAD_NORM = 5.0
 
 # model width/depth
 TCN_D_MODEL   = 64
@@ -29,17 +31,42 @@ TCN_DROPOUT   = 0.15
 TCN_KSIZE     = 3
 TCN_LEVELS    = 4            # dilations: 1,2,4,8
 
-# quantiles + point
-USE_QUANTILES  = True
-QUANTILES      = [0.1, 0.5, 0.9]
-PRED_QUANTILE  = 0.90
-HUBER_DELTA    = 1.0         # for point aux loss
-POINT_BLEND    = np.array([0.2, 0.35, 0.45], dtype=np.float32)  # to align with RMSE
+# heads / objectives
+USE_ZINB_HEAD      = True         # added head: predicts (pi, mu, theta)
+KEEP_QUANTILES     = True         # keep quantile head for RMSE alignment and diagnostics
 
-# learning tricks
-USE_SWA             = True   # Stochastic Weight Averaging for final 25% epochs
-SWA_START_FRAC      = 0.75
-MAX_GRAD_NORM       = 5.0
+# quantiles (kept for aux / inference if desired)
+QUANTILES      = [0.1, 0.5, 0.9]
+PRED_QUANTILE  = 0.90            # used if INFER_POINT="quantile"
+HUBER_DELTA    = 1.0
+POINT_BLEND    = np.array([0.2, 0.35, 0.45], dtype=np.float32)
+
+# curriculum
+PHASE1_EPOCHS      = 5           # 3–5 recommended
+PRETRAIN_MODE      = "nb_mean"   # "nb_mean" or "quantile"
+Q_HIGH             = [0.8, 0.9, 0.95]  # emphasized upper qs in phase 2 (if KEEP_QUANTILES)
+LAMBDA_QHI         = 0.4         # weight for upper-quantile pinball in phase 2
+LAMBDA_ZINB        = 1.0         # main ZINB NLL weight
+LAMBDA_BCE_ZERO    = 0.05        # small aux BCE(pi vs zero indicator) in phase 1 (stabilizes π)
+
+# surge-aware weighting (phase 2)
+SURGE_PRIOR_DEFAULT = 0.20       # fallback prior if not reading CSV
+SURGE_CSV_PATH      = None       # optional: path to surge_ranking_mean.csv with columns [day_index, level]
+SURGE_LEVELS_STORM  = {"Severe", "Extreme"}
+W_SURGE             = 4.0        # upweight surge windows in phase 2
+
+# augmentation (small & realistic; applied only on surge windows by default)
+AUG_ENABLE          = True
+AUG_SURGE_ONLY      = True
+AUG_PROB            = 0.5       # per-batch probability to apply an augmentation
+JITTER_STD_FRAC     = 0.02      # ~2% jitter
+AMP_MAX_FRAC        = 0.10      # ±10% amplitude
+WARP_MAX_FRAC       = 0.10      # up/downsample up to ±10%, then crop/pad
+CUTMIX_PROB         = 0.30      # prob to apply surge-window CutMix within batch
+
+# SWA
+USE_SWA        = True
+SWA_START_FRAC = 0.75
 
 # day split + validation strategy (unchanged)
 TRAIN_LAST_DAY = 80
@@ -50,6 +77,9 @@ CALM_N         = 10
 BEST_BY        = "overall"
 
 ZERO_EPS = 1e-8
+
+# inference choice
+INFER_POINT = "zinb_mean"   # "zinb_mean" | "quantile"
 
 # =======================================================
 # utils
@@ -84,12 +114,12 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
 
 # =======================================================
-# TCN forecaster (minimal, regularized)
+# TCN forecaster (minimal backbone) + dual heads
 # =======================================================
 def _causal_conv1d(x, conv, dilation, ksize):
     # x: (B*N, C, T)
     pad = (ksize - 1) * dilation
-    x = nn.functional.pad(x, (pad, 0))
+    x = F.pad(x, (pad, 0))
     return conv(x)
 
 class _TCNBlock(nn.Module):
@@ -118,15 +148,16 @@ class _TCNBlock(nn.Module):
 class TCNForecaster(nn.Module):
     """
     Input:  (B, T, N, F)
-    Output: (B, N, H, Q) if USE_QUANTILES else (B, N, H)
+    Output: dict {
+        "q": (B, N, H, Q)  if KEEP_QUANTILES else None,
+        "zinb": (logit_pi, raw_mu, raw_theta) each (B, N, H) if USE_ZINB_HEAD
+    }
     """
     def __init__(self, in_channels, horizon, num_nodes):
         super().__init__()
         self.num_nodes   = num_nodes
         self.horizon     = horizon
         self.in_channels = in_channels
-        self.n_quantiles = len(QUANTILES) if USE_QUANTILES else 1
-        out_dim = horizon * self.n_quantiles
 
         self.in_proj = nn.Linear(in_channels, TCN_D_MODEL)
 
@@ -137,12 +168,28 @@ class TCNForecaster(nn.Module):
             layers.append(_TCNBlock(c, c, ksize=TCN_KSIZE, dilation=dil, dropout=TCN_DROPOUT))
         self.tcn = nn.Sequential(*layers)
 
-        self.head = nn.Sequential(
-            nn.Linear(TCN_D_MODEL, TCN_D_MODEL),
-            nn.GELU(),
-            nn.Dropout(TCN_DROPOUT),
-            nn.Linear(TCN_D_MODEL, out_dim),
-        )
+        # heads
+        if KEEP_QUANTILES:
+            out_q = horizon * len(QUANTILES)
+            self.head_q = nn.Sequential(
+                nn.Linear(TCN_D_MODEL, TCN_D_MODEL),
+                nn.GELU(),
+                nn.Dropout(TCN_DROPOUT),
+                nn.Linear(TCN_D_MODEL, out_q),
+            )
+        else:
+            self.head_q = None
+
+        if USE_ZINB_HEAD:
+            # 3 * H (logit_pi, raw_mu, raw_theta) — we apply activations in loss/infer
+            self.head_zinb = nn.Sequential(
+                nn.Linear(TCN_D_MODEL, TCN_D_MODEL),
+                nn.GELU(),
+                nn.Dropout(TCN_DROPOUT),
+                nn.Linear(TCN_D_MODEL, 3 * horizon),
+            )
+        else:
+            self.head_zinb = None
 
     def forward(self, x):
         B, T, N, F = x.shape
@@ -156,9 +203,18 @@ class TCNForecaster(nn.Module):
 
         h = self.tcn(x)                         # (B*N, C, T)
         h_last = h[:, :, -1]                    # (B*N, C)
-        y = self.head(h_last)                   # (B*N, H*Q or H)
-        y = y.view(B, N, self.horizon, self.n_quantiles)
-        return y
+
+        out = {"q": None, "zinb": None}
+        if self.head_q is not None:
+            yq = self.head_q(h_last).view(B, N, self.horizon, len(QUANTILES))
+            out["q"] = yq
+        if self.head_zinb is not None:
+            z = self.head_zinb(h_last).view(B, N, self.horizon, 3)
+            logit_pi = z[..., 0]     # zero-inflation probability (π) logits
+            raw_mu   = z[..., 1]     # to softplus -> μ > 0
+            raw_th   = z[..., 2]     # to softplus -> θ > 0
+            out["zinb"] = (logit_pi, raw_mu, raw_th)
+        return out
 
 # =======================================================
 # day split & scalers
@@ -185,8 +241,23 @@ def _fit_scalers_train_only(y, w, days, train_last_day):
     w_mu, w_sd = zfit(w_tr)
     return {"y_mu": y_mu, "y_sd": y_sd, "w_mu": w_mu, "w_sd": w_sd}
 
+def _load_storm_prior(csv_path: str, train_last_day: int) -> float:
+    if csv_path is None or (not os.path.exists(csv_path)):
+        return float(SURGE_PRIOR_DEFAULT)
+    try:
+        df = pd.read_csv(csv_path)
+        if "day_index" not in df.columns or "level" not in df.columns:
+            return float(SURGE_PRIOR_DEFAULT)
+        df = df[df["day_index"] <= int(train_last_day)].copy()
+        total = max(1, len(df))
+        storm = (df["level"].astype(str).isin(list(SURGE_LEVELS_STORM))).sum()
+        prior = float(storm) / float(total)
+        return float(np.clip(prior, 0.02, 0.8))
+    except Exception:
+        return float(SURGE_PRIOR_DEFAULT)
+
 # =======================================================
-# training split
+# training split (also returns raw Y for ZINB and surge flags/weights)
 # =======================================================
 def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
@@ -204,26 +275,40 @@ def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
     day_last_idx = day_end_idx[train_last_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
-    X_list, Y_list = [], []
+    X_list, Y_sc_list, Y_raw_list = [], [], []
     for node in range(N):
         x_loc_full = X_all[:, node, :]
-        Xw, Yw = build_windows(x_loc_full, y_sc[:, node], SEQ_LEN, horizon)
-        if len(Xw):
-            X_list.append(Xw[:N_train][:, :, None, :])  # (nW, SEQ_LEN, 1, Din)
-            Y_list.append(Yw[:N_train][:, None, :])     # (nW, 1, H)
+        Xw_sc, Yw_sc = build_windows(x_loc_full, y_sc[:, node], SEQ_LEN, horizon)
+        # raw Y windows using *unscaled* y
+        _, Yw_raw = build_windows(np.concatenate([y[:, node:node+1], w[:, node, :]], axis=1), y[:, node], SEQ_LEN, horizon)
+        if len(Xw_sc):
+            X_list.append(Xw_sc[:N_train][:, :, None, :])      # (nW, SEQ_LEN, 1, Din)
+            Y_sc_list.append(Yw_sc[:N_train][:, None, :])      # (nW, 1, H)
+            Y_raw_list.append(Yw_raw[:N_train][:, None, :])    # (nW, 1, H) raw counts
 
     if not X_list:
         raise RuntimeError("No training windows after split; check SEQ_LEN/horizon/TRAIN_LAST_DAY.")
-    X_tr = np.concatenate(X_list, axis=0)
-    Y_tr = np.concatenate(Y_list, axis=0)
+    X_tr    = np.concatenate(X_list, axis=0)
+    Y_tr_sc = np.concatenate(Y_sc_list, axis=0)
+    Y_tr_rw = np.concatenate(Y_raw_list, axis=0)
+
+    # surge flags/weights based on raw future maxima
+    storm_prior = _load_storm_prior(SURGE_CSV_PATH, train_last_day=train_last_day)
+    y_max = np.max(Y_tr_rw.reshape(len(Y_tr_rw), -1), axis=1)
+    thr = np.quantile(y_max, max(0.0, 1.0 - storm_prior))
+    is_surge = (y_max >= thr).astype(np.float32)
+    W_tr = np.where(is_surge > 0.5, W_SURGE, 1.0).astype(np.float32)
+
     aux = {
         "X_all_scaled": X_all,
         "y_scaled": y_sc,
         "timestamps": ts,
         "days": days,
-        "day_end_idx": day_end_idx
+        "day_end_idx": day_end_idx,
+        "storm_prior": float(storm_prior),
+        "surge_thr_raw": float(thr),
     }
-    return X_tr, Y_tr, Din, scalers, aux
+    return X_tr, Y_tr_sc, Y_tr_rw, W_tr, is_surge, Din, scalers, aux
 
 # =======================================================
 # validation roll (full pipeline preserved)
@@ -251,11 +336,8 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=TRAI
         ts_future = pd.to_datetime(ts[fut_start:fut_start+horizon])
         for i, county in enumerate(locs):
             Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, X_all.shape[2])
-            pred_sc = infer(model, Xin_i)[0, 0]  # (H,)
-            y_mu = float(scalers["y_mu"].flatten()[0])
-            y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
-            pred = (pred_sc * y_sd) + y_mu
-            pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
+            pred_sc = infer(model, Xin_i, scalers)[0, 0]  # (H,)
+            pred = np.clip(np.nan_to_num(pred_sc, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
             rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
 
     df_pred = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["timestamp", "location", "pred"])
@@ -547,7 +629,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     return _callback
 
 # =======================================================
-# training / inference
+# objectives
 # =======================================================
 def _pinball_loss(yq, y_true, q_list, quantile_weights=None):
     # yq: (B,N,H,Q), y_true: (B,N,H)
@@ -560,48 +642,206 @@ def _pinball_loss(yq, y_true, q_list, quantile_weights=None):
         loss = loss * qw.view(1,1,1,-1)
     return loss.mean()
 
+def _pinball_subset(yq, y_true, q_list, q_subset):
+    # weight each selected quantile equally
+    qs = np.array(q_list, dtype=float)
+    idx = [int(np.argmin(np.abs(qs - q))) for q in q_subset]
+    ysel = yq[..., idx]  # (B,N,H,len(idx))
+    return _pinball_loss(ysel, y_true, [q_list[i] for i in idx])
+
 def _huber(x, delta=1.0):
     absx = torch.abs(x)
     quad = torch.minimum(absx, torch.tensor(delta, device=x.device, dtype=x.dtype))
     lin  = absx - quad
     return 0.5 * quad * quad + delta * lin
 
-def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
+def _nb_log_prob(y, mu, theta):
+    # y, mu, theta >= 0; shape broadcastable; NB parameterized by mean mu, dispersion theta
+    # log NB(y; mu, theta) = lgamma(y+theta) - lgamma(theta) - lgamma(y+1)
+    #                      + theta*log(theta/(theta+mu)) + y*log(mu/(theta+mu))
+    t1 = torch.lgamma(y + theta) - torch.lgamma(theta) - torch.lgamma(y + 1.0)
+    t2 = theta * (torch.log(theta) - torch.log(theta + mu + 1e-12))
+    t3 = y * (torch.log(mu + 1e-12) - torch.log(theta + mu + 1e-12))
+    return t1 + t2 + t3
+
+def _zinb_nll(y, logit_pi, raw_mu, raw_theta, sample_weight=None):
+    """
+    y:        (B,N,H) non-negative (raw scale)
+    logit_pi: (B,N,H) logits of zero-inflation probability π
+    raw_mu:   (B,N,H) to softplus -> μ
+    raw_th:   (B,N,H) to softplus -> θ
+    """
+    pi   = torch.sigmoid(logit_pi)                # π in (0,1) : prob of *extra* zero
+    mu   = F.softplus(raw_mu) + 1e-6             # μ > 0
+    th   = F.softplus(raw_theta) + 1e-6          # θ > 0
+
+    log_pi   = -F.softplus(-logit_pi)            # log σ(x)
+    log_1mpi = -F.softplus(logit_pi)             # log (1 - σ(x))
+
+    # NB log prob
+    lognb = _nb_log_prob(y, mu, th)
+    # y==0 branch uses logsumexp(log π, log(1-π)+logNB(y=0))
+    is_zero = (y <= 0.0 + 1e-7).float()
+    lognb0 = th * (torch.log(th) - torch.log(th + mu))  # NB log prob at y=0 (simplified)
+    loglik_zero = torch.logsumexp(torch.stack([log_pi, log_1mpi + lognb0], dim=-1), dim=-1)
+    loglik_pos  = (log_1mpi + lognb)
+
+    loglik = is_zero * loglik_zero + (1.0 - is_zero) * loglik_pos
+    nll = -loglik
+    if sample_weight is not None:
+        # sample_weight: (B,) or (B,1,1)
+        sw = sample_weight
+        while sw.dim() < nll.dim():
+            sw = sw.unsqueeze(-1)
+        nll = nll * sw
+    return nll.mean(), (pi, mu, th)
+
+# =======================================================
+# augmentations (small, realistic; default applied to surge windows only)
+# =======================================================
+def _maybe_apply_augments(xb, is_surge_batch):
+    """
+    xb: (B, T, 1, Din)  (on device)
+    is_surge_batch: (B,) float {0,1}
+    """
+    if not AUG_ENABLE:
+        return xb
+
+    B, T, _, Din = xb.shape
+    # mask for which samples to augment
+    if AUG_SURGE_ONLY:
+        eligible = (is_surge_batch > 0.5)
+    else:
+        eligible = torch.ones(B, device=xb.device, dtype=torch.bool)
+    idx = torch.where(eligible)[0]
+    if idx.numel() == 0:
+        return xb
+
+    x = xb.clone()
+
+    # Randomly choose which aug to apply this batch
+    if torch.rand(1, device=xb.device).item() < AUG_PROB:
+        choice = torch.randint(0, 4, (1,), device=xb.device).item()
+
+        if choice == 0:
+            # JITTER: add small Gaussian noise (2% of per-feature std over time)
+            std = x[:, :, 0, :].std(dim=1, keepdim=True).clamp_min(1e-6)
+            noise = torch.randn_like(x[:, :, 0, :]) * (JITTER_STD_FRAC * std)
+            x[idx, :, 0, :] = x[idx, :, 0, :] + noise[idx]
+
+        elif choice == 1:
+            # AMPLITUDE scaling ±10%
+            scale = 1.0 + (2.0 * AMP_MAX_FRAC) * (torch.rand((idx.numel(), 1, 1), device=x.device) - 0.5)
+            x[idx, :, 0, :] = x[idx, :, 0, :] * scale
+
+        elif choice == 2:
+            # TIME-WARP (resample length by s in [1-W, 1+W], then crop/pad back to T)
+            s = 1.0 + (2.0 * WARP_MAX_FRAC) * (torch.rand(idx.numel(), device=x.device) - 0.5)
+            # reshape to (N,C,L) for interpolate; treat features as channels
+            feat = x[idx, :, 0, :].permute(0, 2, 1)  # (k, Din, T)
+            warped = []
+            for i in range(feat.size(0)):
+                Ti = int(max(2, round(T * s[i].item())))
+                zi = F.interpolate(feat[i:i+1], size=Ti, mode="linear", align_corners=False)
+                zi = zi[0]  # (Din, Ti)
+                if Ti > T:
+                    start = (Ti - T) // 2
+                    zi = zi[:, start:start+T]
+                elif Ti < T:
+                    pad = T - Ti
+                    last = zi[:, -1:].expand(-1, pad)
+                    zi = torch.cat([zi, last], dim=1)
+                warped.append(zi.unsqueeze(0))
+            warped = torch.cat(warped, dim=0)        # (k, Din, T)
+            x[idx, :, 0, :] = warped.permute(0, 2, 1)
+
+        else:
+            # CUTMIX (surge only): replace a random contiguous subwindow from another surge example (keeps labels)
+            if idx.numel() >= 2 and torch.rand(1, device=x.device).item() < CUTMIX_PROB:
+                perm = idx[torch.randperm(idx.numel(), device=x.device)]
+                Lmin = max(2, int(0.2 * T)); Lmax = max(Lmin+1, int(0.5 * T))
+                Lseg = torch.randint(Lmin, Lmax, (1,), device=x.device).item()
+                s0 = torch.randint(0, T - Lseg + 1, (1,), device=x.device).item()
+                s1 = s0 + Lseg
+                x[idx, s0:s1, 0, :] = x[perm, s0:s1, 0, :]
+
+    return x
+
+# =======================================================
+# training / inference
+# =======================================================
+def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, eval_callback=None):
     if len(X) == 0:
         return None
 
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
-                       torch.tensor(Y, dtype=torch.float32))
+                       torch.tensor(Y_sc, dtype=torch.float32),
+                       torch.tensor(Y_rw, dtype=torch.float32),
+                       torch.tensor(W, dtype=torch.float32),
+                       torch.tensor(is_surge_all, dtype=torch.float32))
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
     model = TCNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    # ReduceLROnPlateau on training loss
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
 
-    # Optional SWA in the tail
+    # SWA
     if USE_SWA:
         from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
         swa_start = int(EPOCHS * SWA_START_FRAC)
         swa_model = AveragedModel(model)
         swa_sched = SWALR(opt, swa_lr=LR * 0.5)
 
+    # phase split
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0.0
-        for xb, yb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            opt.zero_grad()
-            yq = model(xb)                # (B,N,H,Q)
 
-            # pinball + small huber on blended point to align with RMSE
-            loss = _pinball_loss(yq, yb, QUANTILES, quantile_weights=POINT_BLEND)
-            with torch.no_grad():
-                qw = torch.tensor(POINT_BLEND, device=yq.device, dtype=yq.dtype)
-                qw = qw / qw.sum()
-            y_point = (yq * qw.view(1,1,1,-1)).sum(-1)    # (B,N,H)
-            loss = loss + 0.15 * _huber(y_point - yb, delta=HUBER_DELTA).mean()
+        in_phase1 = (epoch < PHASE1_EPOCHS)
+        for xb, y_sc, y_rw, wb, is_surge_b in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
+            xb = xb.to(DEVICE)
+            y_sc = y_sc.to(DEVICE)      # scaled (for quantiles)
+            y_rw = y_rw.to(DEVICE)      # raw   (for ZINB)
+            wb = wb.to(DEVICE)          # sample weights
+            is_surge_b = is_surge_b.to(DEVICE)
+
+            if AUG_ENABLE:
+                xb = _maybe_apply_augments(xb, is_surge_b)
+
+            opt.zero_grad()
+            out = model(xb)
+            loss = 0.0
+
+            # ----- Phase 1: fit trend (NB mean or median quantile) -----
+            if in_phase1:
+                if USE_ZINB_HEAD and out["zinb"] is not None and PRETRAIN_MODE == "nb_mean":
+                    logit_pi, raw_mu, raw_th = out["zinb"]
+                    mu = F.softplus(raw_mu) + 1e-6
+                    # trend fit: Huber/MSE on mean vs raw y
+                    loss_trend = _huber(mu - y_rw, delta=HUBER_DELTA).mean()
+                    loss = loss + loss_trend
+                    # small aux: π should align with zero indicator
+                    zero_ind = (y_rw <= 0.0 + 1e-7).float()
+                    bce = F.binary_cross_entropy_with_logits(logit_pi, zero_ind)
+                    loss = loss + LAMBDA_BCE_ZERO * bce
+                if KEEP_QUANTILES and out["q"] is not None and PRETRAIN_MODE == "quantile":
+                    yq = out["q"]
+                    # emphasize mid/lower quantiles for stability
+                    loss = loss + _pinball_subset(yq, y_sc.squeeze(1), QUANTILES, [0.1, 0.5])
+
+            # ----- Phase 2: ZINB NLL (+ high-quantile pinball) -----
+            else:
+                if USE_ZINB_HEAD and out["zinb"] is not None:
+                    logit_pi, raw_mu, raw_th = out["zinb"]
+                    # upweight surges via sample weights wb (precomputed)
+                    loss_zinb, _ = _zinb_nll(y_rw.squeeze(1), logit_pi.squeeze(1), raw_mu.squeeze(1), raw_th.squeeze(1),
+                                             sample_weight=wb)
+                    loss = loss + LAMBDA_ZINB * loss_zinb
+
+                if KEEP_QUANTILES and out["q"] is not None and len(Q_HIGH) > 0:
+                    yq = out["q"]
+                    loss_hi = _pinball_subset(yq, y_sc.squeeze(1), QUANTILES, Q_HIGH)
+                    loss = loss + LAMBDA_QHI * loss_hi
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
@@ -610,36 +850,54 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             epoch_loss += loss.item() * xb.size(0)
 
         epoch_loss /= len(dl.dataset)
-        # scheduler step
         sched.step(epoch_loss)
 
         # SWA averaging after swa_start
         if USE_SWA and (epoch >= swa_start):
             swa_model.update_parameters(model)
             swa_sched.step()
-        print(f"[Epoch {epoch+1}/{EPOCHS}] TrainLoss={epoch_loss:.6f} | LR={opt.param_groups[0]['lr']:.2e}")
+
+        print(f"[Epoch {epoch+1}/{EPOCHS}] Phase={'1' if in_phase1 else '2'} | TrainLoss={epoch_loss:.6f} | LR={opt.param_groups[0]['lr']:.2e}")
 
         if eval_callback is not None:
             eval_callback(model if not USE_SWA or epoch < swa_start else swa_model, epoch + 1)
 
-    # If SWA used, update BN stats and return swa weights
     if USE_SWA:
         from torch.optim.swa_utils import update_bn
+        # recompute BN stats on (possibly augmented) data
         update_bn(dl, swa_model)
         return swa_model
     return model
 
 @torch.no_grad()
-def infer(model, Xin):
+def infer(model, Xin, scalers):
     model.eval()
-    yq = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))  # (1,N,H,Q)
-    if USE_QUANTILES:
+    out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
+    # Return *original-scale* predictions for RMSE alignment
+    if INFER_POINT == "zinb_mean" and out["zinb"] is not None:
+        logit_pi, raw_mu, raw_th = out["zinb"]
+        pi = torch.sigmoid(logit_pi)
+        mu = F.softplus(raw_mu) + 1e-6
+        y_point = (1.0 - pi) * mu    # E[Y] under our π=Pr(extra zero) convention
+        out_np = y_point.cpu().numpy()
+        return out_np
+    else:
+        # fall back to quantile (scaled -> unscale)
+        yq = out["q"]
+        if yq is None:
+            # if only ZINB available, use its mean
+            logit_pi, raw_mu, raw_th = out["zinb"]
+            pi = torch.sigmoid(logit_pi)
+            mu = F.softplus(raw_mu) + 1e-6
+            return ((1.0 - pi) * mu).cpu().numpy()
         qs = np.array(QUANTILES, dtype=float)
         idx = int(np.argmin(np.abs(qs - float(PRED_QUANTILE))))
-        out = yq[..., idx]
-    else:
-        out = yq
-    return out.cpu().numpy()
+        y_sc = yq[..., idx]  # (1,N,H)
+        # unscale
+        y_mu = float(scalers["y_mu"].flatten()[0])
+        y_sd = float(scalers["y_sd"].flatten()[0]) if float(scalers["y_sd"].flatten()[0]) != 0.0 else 1.0
+        y = (y_sc * y_sd) + y_mu
+        return y.cpu().numpy()
 
 # =======================================================
 # test-time prediction (unchanged interface)
@@ -658,9 +916,7 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     rows = []
     for i, county in enumerate(locs):
         Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
-        pred_sc = infer(model, Xin_i)[0, 0]
-
-        pred = (pred_sc * scalers["y_sd"].flatten()[0]) + scalers["y_mu"].flatten()[0]
+        pred = infer(model, Xin_i, scalers)[0, 0]   # already original scale if ZINB; else unscaled above
         pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
         rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
     return pd.concat(rows, ignore_index=True)
@@ -685,21 +941,21 @@ def main():
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
     # ---- Prepare once
-    X24, Y24, Din, scalers24, aux24 = prepare_training_split(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
-    X48, Y48, _,  scalers48, aux48  = prepare_training_split(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
+    X24, Y24_sc, Y24_rw, W24, S24, Din, scalers24, aux24 = prepare_training_split(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
+    X48, Y48_sc, Y48_rw, W48, S48, _,   scalers48, aux48  = prepare_training_split(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
     n_nodes = 1
 
     # ---- 24h
     val_cb24 = make_val_callback_rolling(ds_train, scalers24, H24, aux24, label="24h",
                                          train_last_day=TRAIN_LAST_DAY,
                                          ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24)
-    mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
+    mdl24 = train_model(X24, Y24_sc, Y24_rw, W24, S24, Din, H24, n_nodes, scalers24, eval_callback=val_cb24)
 
     # ---- 48h
     val_cb48 = make_val_callback_rolling(ds_train, scalers48, H48, aux48, label="48h",
                                          train_last_day=TRAIN_LAST_DAY,
                                          ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48)
-    mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
+    mdl48 = train_model(X48, Y48_sc, Y48_rw, W48, S48, Din, H48, n_nodes, scalers48, eval_callback=val_cb48)
 
     # ----- Final test with best checkpoint if present -----
     def _finalize(model, scalers, H, ts_future, df_truth, tag, zero_rmse):
