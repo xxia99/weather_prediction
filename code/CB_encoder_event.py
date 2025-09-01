@@ -13,14 +13,6 @@ import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
-# ---------------- config ----------------
-SPLIT_DIR = "data/"
-# OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = "results_seq_mse_pre-CB_contrastive_use-moe/update_distribution"
-# OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
-# OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
-os.makedirs(OUT_DIR, exist_ok=True)
-
 # ---- NEW: path to your 90-day surge ranking CSV (from rank_surges.py) ----
 SURGE_CSV_PATH       = "results_surge/surge_ranking_mean.csv"
 USE_SURGE_PRIOR      = True      # turn off to ignore CSV and run as before
@@ -55,6 +47,17 @@ STEM_NBLOCKS  = 2
 STEM_D_EMB    = 32
 STEM_DROPOUT  = 0.03
 
+# Day split
+TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
+
+# ---------------- config ----------------
+SPLIT_DIR = "data/"
+# OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
+OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}"
+# OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
+# OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
+os.makedirs(OUT_DIR, exist_ok=True)
+
 # Pretrained encoder options
 if "non" in OUT_DIR:
     USE_PRETRAINED_ENCODER = False
@@ -70,8 +73,6 @@ else:
     USE_CB_ENCODER          = True
 CB_ENCODER_CKPT = "results_lora/new/pretrained_cb_encoder_peft_independent_H24.pt"
 
-# Day split
-TRAIN_LAST_DAY = 80   # days 1..80 train; day-ahead roll on 81..end
 
 # Event-stratified validation
 EVENT_METHOD   = "mean"
