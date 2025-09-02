@@ -1,10 +1,16 @@
 import os
+GLOBAL_SEED = 99  # === SEEDING: set your global seed here ===
+# Make hashing & some CUDA matmuls deterministic as early as possible (before importing torch)
+os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 from tqdm import tqdm
 import numpy as np
 import time
 import pandas as pd
 import xarray as xr
 import math
+import random  # === SEEDING: python's RNG
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +32,7 @@ BATCH_SIZE    = 64
 EPOCHS        = 40
 LR            = 5e-4
 WEIGHT_DECAY  = 5e-5
-DEVICE        = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE        = f"cuda:{GLOBAL_SEED%4}" if torch.cuda.is_available() else "cpu"
 
 # temporal dropout
 TEMPORAL_DROP_PROB = 0.0
@@ -53,7 +59,7 @@ TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
 # OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}"
+OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}"
 # OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
 # OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -106,6 +112,25 @@ PRED_QUANTILE   = 0.90
 DEFAULT_STORM_PRIOR = 0.20        # used if CSV missing
 CB_BETA             = 0.999       # "effective number" smoothing for pos weight (Cui et al. 2019)
 CLIP_POS_WEIGHT     = 10.0        # safety cap
+
+# === SEEDING: helper to make runs reproducible ===
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic/cuDNN settings
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+    # Make PyTorch select deterministic algorithms when possible
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
 # ---------------- utils ----------------
 def open_ds(path):
@@ -807,7 +832,7 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             storm_top_q=STORM_TOP_Q,
             calm_bottom_q=CALM_BOTTOM_Q,
             calm_n=CALM_N,
-            seed=42
+            seed=GLOBAL_SEED  # === SEEDING: use global seed instead of hard-coded 42
         )
 
         zpnz_model, nzpz_model = _zero_nonzero_ratios(df_truth_val, df_pred_val, eps=ZERO_EPS)
@@ -963,7 +988,9 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
                        torch.tensor(Y, dtype=torch.float32),
                        torch.tensor(W, dtype=torch.float32))
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    # === SEEDING: use a seeded generator for DataLoader shuffling
+    dl_gen = torch.Generator(device="cpu").manual_seed(GLOBAL_SEED)
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, generator=dl_gen)
     model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
 
     enc_params = list(model.patch.parameters())
@@ -1127,6 +1154,9 @@ def make_eval_callback(ds_train, scalers, horizon, ts_future, df_truth, label):
 
 # ---------------- main ----------------
 def main():
+    # === SEEDING: call once at program start ===
+    seed_everything(GLOBAL_SEED)
+
     ds_train = open_ds(os.path.join(SPLIT_DIR, "train.nc"))
     ds_test24 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_24h_demo.nc"))
     ds_test48 = xr.open_dataset(os.path.join(SPLIT_DIR, "test_48h_demo.nc"))
