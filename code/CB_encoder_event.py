@@ -247,8 +247,18 @@ class ChronosBoltEncoderPEFT(nn.Module):
         ck = torch.load(ckpt_path, map_location="cpu")
         cb_model_name = ck.get("cb_model_name", "amazon/chronos-bolt-mini")
         d_out         = int(ck.get("d_out", 64))
-        self.in_channels = int(ck.get("in_channels", in_channels))
+
+        # expected feature dim during pretraining (usually 110)
+        expected_in = int(ck.get("in_channels", in_channels))
+        self.in_channels = expected_in
         self.d_model = d_out
+
+        # allow extra engineered features by projecting to expected dim
+        if in_channels != expected_in:
+            self.input_proj = nn.Linear(in_channels, expected_in)
+            print(f"[CB Encoder] Adapting feature dim {in_channels}->{expected_in} via linear projection")
+        else:
+            self.input_proj = None
 
         try:
             from transformers import AutoModel, AutoConfig
@@ -276,7 +286,7 @@ class ChronosBoltEncoderPEFT(nn.Module):
         hidden_dim = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
         if hidden_dim is None:
             raise RuntimeError("Cannot determine Chronos hidden size from config.")
-        self.embed_proj = nn.Linear(self.in_channels, hidden_dim)
+        self.embed_proj = nn.Linear(expected_in, hidden_dim)
         self.post_proj  = nn.Linear(hidden_dim, self.d_model)
 
         self.backbone = backbone
@@ -285,7 +295,11 @@ class ChronosBoltEncoderPEFT(nn.Module):
 
     def forward(self, x):
         B, T, N, F = x.shape
-        assert F == self.in_channels, f"CB encoder expected F={self.in_channels}, got {F}"
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+            F = self.in_channels
+        else:
+            assert F == self.in_channels, f"CB encoder expected F={self.in_channels}, got {F}"
         x_bn = x.permute(0, 2, 1, 3).reshape(B * N, T, F)
         emb  = self.embed_proj(x_bn)
         attn_mask = torch.ones(B * N, T, dtype=torch.long, device=emb.device)
