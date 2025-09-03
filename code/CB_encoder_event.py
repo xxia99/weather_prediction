@@ -1,5 +1,5 @@
 import os
-GLOBAL_SEED = 99  # === SEEDING: set your global seed here ===
+GLOBAL_SEED = 3  # === SEEDING: set your global seed here ===
 # Make hashing & some CUDA matmuls deterministic as early as possible (before importing torch)
 os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -29,7 +29,7 @@ SURGE_LEVELS_CALMISH = {"Calm", "Mild"}       # treated as "calmish"
 # core training hyperparameters
 SEQ_LEN       = 24
 BATCH_SIZE    = 64
-EPOCHS        = 40
+EPOCHS        = 100
 LR            = 5e-4
 WEIGHT_DECAY  = 5e-5
 DEVICE        = f"cuda:{GLOBAL_SEED%4}" if torch.cuda.is_available() else "cpu"
@@ -59,7 +59,7 @@ TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
 # OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}"
+OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
 # OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
 # OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
 os.makedirs(OUT_DIR, exist_ok=True)
