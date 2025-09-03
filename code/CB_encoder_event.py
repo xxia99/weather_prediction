@@ -33,6 +33,7 @@ EPOCHS        = 100
 LR            = 5e-4
 WEIGHT_DECAY  = 5e-5
 DEVICE        = f"cuda:{GLOBAL_SEED%4}" if torch.cuda.is_available() else "cpu"
+CURRICULUM_EPOCHS = 10  # epochs to ramp up storm sample weights
 
 # temporal dropout
 TEMPORAL_DROP_PROB = 0.0
@@ -55,6 +56,9 @@ STEM_DROPOUT  = 0.03
 
 # Day split
 TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
+
+# Optional fixed spatial adjacency matrix (83x83). If file is missing, use learned adjacency.
+ADJ_PATH = os.path.join("data", "adjacency.npy")
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
@@ -320,11 +324,18 @@ class _TemporalConv(nn.Module):
         return y
 
 class _AdaptiveAdjacency(nn.Module):
-    def __init__(self, num_nodes, d_emb):
+    def __init__(self, num_nodes, d_emb, A_init=None):
         super().__init__()
-        self.E = nn.Parameter(torch.randn(num_nodes, d_emb))
+        if A_init is not None:
+            self.register_buffer("A_fixed", A_init)
+            self.E = None
+        else:
+            self.E = nn.Parameter(torch.randn(num_nodes, d_emb))
+            self.register_buffer("A_fixed", None)
 
     def forward(self):
+        if self.A_fixed is not None:
+            return self.A_fixed
         E = self.E
         A = torch.relu(E @ E.t())
         A = torch.softmax(A, dim=1)
@@ -356,11 +367,11 @@ class _GraphDiffusion(nn.Module):
         return out
 
 class _StemBlock(nn.Module):
-    def __init__(self, d_in, d_model, k_order, num_nodes, d_emb, dropout=0.0):
+    def __init__(self, d_in, d_model, k_order, num_nodes, d_emb, dropout=0.0, adj=None):
         super().__init__()
         self.in_proj  = nn.Linear(d_in, d_model)
         self.tconv    = _TemporalConv(d_model, dropout=dropout)
-        self.adaptA   = _AdaptiveAdjacency(num_nodes, d_emb)
+        self.adaptA   = _AdaptiveAdjacency(num_nodes, d_emb, A_init=adj)
         self.gdiff    = _GraphDiffusion(k_order, d_model, dropout=dropout)
         self.out_norm = nn.LayerNorm(d_model)
 
@@ -410,13 +421,14 @@ class MoEReadout(nn.Module):
 
 # -------------------- Forecaster --------------------
 class STGNNForecaster(nn.Module):
-    def __init__(self, in_channels, horizon, num_nodes):
+    def __init__(self, in_channels, horizon, num_nodes, adj=None):
         super().__init__()
         self.num_nodes   = num_nodes
         self.horizon     = horizon
         self.in_channels = in_channels
         self.n_quantiles = len(QUANTILES) if USE_QUANTILES else 1
         out_dim = horizon * self.n_quantiles
+        self._adj = adj
 
         if USE_CB_ENCODER and os.path.exists(CB_ENCODER_CKPT):
             self.patch = ChronosBoltEncoderPEFT(in_channels=in_channels, ckpt_path=CB_ENCODER_CKPT)
@@ -458,6 +470,7 @@ class STGNNForecaster(nn.Module):
                     num_nodes=num_nodes,
                     d_emb=STEM_D_EMB,
                     dropout=STEM_DROPOUT,
+                    adj=self._adj,
                 )
             )
             d_in = STEM_D_MODEL
@@ -555,6 +568,14 @@ def _cb_pos_weight_from_prior(prior: float, beta: float = CB_BETA, cap: float = 
     eff = min(cap, raw)
     return float(eff)
 
+def _load_adj_matrix(path: str, num_nodes: int):
+    if path and os.path.exists(path):
+        A = np.load(path)
+        if A.shape != (num_nodes, num_nodes):
+            raise ValueError(f"Adjacency shape {A.shape} mismatch num_nodes={num_nodes}")
+        return torch.tensor(A, dtype=torch.float32)
+    return None
+
 # ---------------- training data prep (returns sample weights too) ----------------
 def prepare_training_split(ds_train, horizon, train_last_day=80):
     """
@@ -569,13 +590,16 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
     T, N, F = w.shape
-    Din = 1 + F
 
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
 
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                               # (T, N, Din)
+    # --- simple feature engineering: append first differences ---
+    w_diff = np.diff(w_sc, axis=0, prepend=w_sc[:1])
+    w_fe = np.concatenate([w_sc, w_diff], axis=2)
+    Din = 1 + w_fe.shape[2]
+    X_all = np.concatenate([y_sc[..., None], w_fe], axis=2)                               # (T, N, Din)
 
     N_total = T - SEQ_LEN - horizon + 1
     if N_total <= 0:
@@ -991,7 +1015,8 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
     # === SEEDING: use a seeded generator for DataLoader shuffling
     dl_gen = torch.Generator(device="cpu").manual_seed(GLOBAL_SEED)
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, generator=dl_gen)
-    model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
+    adj = _load_adj_matrix(ADJ_PATH, n_nodes)
+    model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes, adj=adj).to(DEVICE)
 
     enc_params = list(model.patch.parameters())
     enc_ids = set(id(p) for p in enc_params)
@@ -1007,6 +1032,7 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
             ],
             weight_decay=WEIGHT_DECAY
         )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
 
     loss_fn_point = nn.MSELoss()
 
@@ -1022,8 +1048,10 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
         model.train()
         epoch_loss = 0.0
         start_time = time.time()
+        weight_scale = min(1.0, (epoch + 1) / float(CURRICULUM_EPOCHS))
         for xb, yb, wb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
             xb, yb, wb = xb.to(DEVICE), yb.to(DEVICE), wb.to(DEVICE)
+            wb = 1.0 + (wb - 1.0) * weight_scale
 
             if TEMPORAL_DROP_PROB > 0.0:
                 with torch.no_grad():
@@ -1036,7 +1064,6 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
             if USE_QUANTILES:
                 loss = _pinball_loss(pred, yb, QUANTILES, sample_weight=wb, quantile_weights=QW)
             else:
-                # point loss can also be sample-weighted if desired
                 per = (pred - yb).pow(2).mean(dim=(1,2))
                 loss = (per * wb).mean()
 
@@ -1061,6 +1088,7 @@ def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
         else:
             print(f"[Epoch {epoch+1}/{EPOCHS}] Loss: {epoch_loss:.6f} | Time: {elapsed:.2f}s | LR: {lr_str}")
 
+        scheduler.step()
         if eval_callback is not None:
             eval_callback(model, epoch + 1)
 
