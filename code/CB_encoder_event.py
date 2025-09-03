@@ -290,7 +290,12 @@ class ChronosBoltEncoderPEFT(nn.Module):
         self.post_proj  = nn.Linear(hidden_dim, self.d_model)
 
         self.backbone = backbone
-        self.load_state_dict(ck["state_dict"], strict=True)
+        load_status = self.load_state_dict(ck["state_dict"], strict=False)
+        missing, unexpected = load_status.missing_keys, load_status.unexpected_keys
+        if missing:
+            print(f"[CB Encoder] Missing keys when loading ckpt: {missing}")
+        if unexpected:
+            print(f"[CB Encoder] Unexpected keys in ckpt: {unexpected}")
         print(f"[CB Encoder] Loaded PEFT encoder from: {ckpt_path} | d_out={self.d_model}")
 
     def forward(self, x):
