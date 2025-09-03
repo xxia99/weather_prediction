@@ -14,8 +14,9 @@ from demo_evaluate import load_truth_wide, per_county_rmse_mean
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-# OUT_DIR   = "results_seq_mse_pre-CB_use-moe/lora_new"
-OUT_DIR   = "results_seq_mse_pre-patch_use-moe/freeze"
+# OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
+OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_new_lora_2"
+# OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
 # OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -53,7 +54,7 @@ if "non" in OUT_DIR:
 else:
     PRETRAINED_ENCODER_PATH = "results_seq/pretrained_patchtst_validation.pt"
 ENCODER_LR              = 3e-4  # allow modest encoder fine-tuning
-FREEZE_ENCODER          = True # fine-tune the encoder with the forecaster
+FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 
 # === Use Chronos-Bolt PEFT encoder instead of PatchTST (NEW) ===
 if "patch" in OUT_DIR:
@@ -62,8 +63,9 @@ else:
     USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
-CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
 # CB_ENCODER_CKPT = "results_lora_variables-only/pretrained_cb_encoder_peft_independent_H24.pt"
+# CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"   # best so far
+CB_ENCODER_CKPT = "results_lora/new/pretrained_cb_encoder_peft_independent_H24.pt"
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 
@@ -84,6 +86,12 @@ MOE_TOP_K      = 2         # top-k routing (1 or 2 common)
 MOE_HIDDEN     = 128       # hidden width inside each expert MLP
 MOE_DROPOUT    = 0.10
 W_MOE_AUX      = 1e-2      # weight for MoE load-balancing aux loss (KL to uniform)
+
+# ========= NEW: Probabilistic head with quantiles =========
+USE_QUANTILES   = True                       # if False -> classic point MSE
+QUANTILES       = [0.1, 0.5, 0.9]            # any list of (0,1); 0.5 is median
+PRED_QUANTILE   = 0.90                       # which quantile to turn into a point forecast for eval
+# You can change to 0.5 (median) for less aggressive spikes.
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -376,14 +384,14 @@ class _StemBlock(nn.Module):
         h  = self.out_norm(h0 + hg)          # residual
         return h
 
-# -------------------- NEW: MoE readout head --------------------
+# -------------------- NEW: MoE readout head (now supports arbitrary out_dim) --------------------
 class MoEReadout(nn.Module):
     """
     Minimal top-k router + MLP experts.
     Inputs: h_last (B, N, D)
-    Outputs: y (B, N, H), aux_loss (scalar), probs_mean (E,)
+    Outputs: y (B, N, OUT_DIM), aux_loss (scalar), probs_mean (E,)
     """
-    def __init__(self, d_in, horizon, num_experts=4, hidden=128, top_k=2, dropout=0.1):
+    def __init__(self, d_in, out_dim, num_experts=4, hidden=128, top_k=2, dropout=0.1):
         super().__init__()
         self.num_experts = int(num_experts)
         self.top_k = int(max(1, min(top_k, self.num_experts)))
@@ -393,7 +401,7 @@ class MoEReadout(nn.Module):
                 nn.Linear(d_in, hidden),
                 nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden, horizon)
+                nn.Linear(hidden, out_dim)
             ) for _ in range(self.num_experts)
         ])
 
@@ -413,16 +421,15 @@ class MoEReadout(nn.Module):
             topi = torch.arange(self.num_experts, device=h_last.device).view(1,1,self.num_experts).expand(B,N,self.num_experts)
             topw = probs
 
-        # compute expert outputs
-        # stack: (B, N, H, E)
+        # expert outputs stacked: (B, N, OUT_DIM, E)
         expert_outs = torch.stack([exp(h_last) for exp in self.experts], dim=-1)
 
-        # gather top-k expert outputs: index shape -> (B,N,H,K)
+        # gather top-k expert outputs: (B,N,OUT_DIM,K)
         gather_idx = topi.unsqueeze(-2).expand(B, N, expert_outs.size(-2), self.top_k if self.top_k < self.num_experts else self.num_experts)
-        selected = expert_outs.gather(dim=-1, index=gather_idx)    # (B, N, H, K)
+        selected = expert_outs.gather(dim=-1, index=gather_idx)
 
         # combine with weights
-        y = (selected * topw.unsqueeze(-2)).sum(dim=-1)            # (B, N, H)
+        y = (selected * topw.unsqueeze(-2)).sum(dim=-1)            # (B, N, OUT_DIM)
 
         # auxiliary load-balancing loss: KL(probs_mean || uniform)
         probs_mean = probs.mean(dim=(0,1))                         # (E,)
@@ -436,13 +443,17 @@ class STGNNForecaster(nn.Module):
     """
     Encoder -> stacked Stem blocks -> temporal pooling -> (MoE or Linear) readout.
     Input:  x (B, T, N, F_in)
-    Output: (B, N, H)
+    Output:
+      - if USE_QUANTILES: (B, N, H, Q)
+      - else:             (B, N, H)
     """
     def __init__(self, in_channels, horizon, num_nodes):
         super().__init__()
         self.num_nodes   = num_nodes
         self.horizon     = horizon
         self.in_channels = in_channels
+        self.n_quantiles = len(QUANTILES) if USE_QUANTILES else 1
+        out_dim = horizon * self.n_quantiles
 
         if USE_CB_ENCODER and os.path.exists(CB_ENCODER_CKPT):
             self.patch = ChronosBoltEncoderPEFT(in_channels=in_channels, ckpt_path=CB_ENCODER_CKPT)
@@ -458,7 +469,7 @@ class STGNNForecaster(nn.Module):
                 dropout=PATCH_DROPOUT,
                 ff=PATCH_FF
             )
-            if PRETRAINED_ENCODER_PATH is not None and os.path.exists(PRETRAINED_ENCODER_PATH):
+            if 'PRETRAINED_ENCODER_PATH' in globals() and PRETRAINED_ENCODER_PATH is not None and os.path.exists(PRETRAINED_ENCODER_PATH):
                 try:
                     ckpt = torch.load(PRETRAINED_ENCODER_PATH, map_location="cpu")
                     state = ckpt.get("state_dict", ckpt)
@@ -489,17 +500,17 @@ class STGNNForecaster(nn.Module):
             d_in = STEM_D_MODEL
         self.blocks = nn.ModuleList(blocks)
 
-        # ===== NEW: choose readout =====
+        # ===== choose readout =====
         if USE_MOE:
             self.readout_moe = MoEReadout(
-                d_in=STEM_D_MODEL, horizon=horizon,
+                d_in=STEM_D_MODEL, out_dim=out_dim,
                 num_experts=MOE_NUM_EXPERTS, hidden=MOE_HIDDEN,
                 top_k=MOE_TOP_K, dropout=MOE_DROPOUT
             )
             self.readout = None
-            print(f"[MoE] Enabled: E={MOE_NUM_EXPERTS}, top_k={MOE_TOP_K}, hidden={MOE_HIDDEN}")
+            print(f"[MoE] Enabled: E={MOE_NUM_EXPERTS}, top_k={MOE_TOP_K}, hidden={MOE_HIDDEN}, out_dim={out_dim}")
         else:
-            self.readout = nn.Linear(STEM_D_MODEL, horizon)
+            self.readout = nn.Linear(STEM_D_MODEL, out_dim)
             self.readout_moe = None
 
         # buffers for aux stats
@@ -519,14 +530,19 @@ class STGNNForecaster(nn.Module):
         last = h[:, -1]  # (B, N, D)
 
         if self.readout_moe is not None:
-            y, aux, probs_mean = self.readout_moe(last)  # y: (B,N,H)
+            y_flat, aux, probs_mean = self.readout_moe(last)  # (B,N,H*Q)
             self._last_aux_loss = aux
             self._last_gate_mean = probs_mean.detach()
         else:
-            y = self.readout(last)       # (B, N, H)
+            y_flat = self.readout(last)                       # (B,N,H*Q or H)
             self._last_aux_loss = None
             self._last_gate_mean = None
-        return y
+
+        if USE_QUANTILES:
+            y = y_flat.view(B, N, self.horizon, self.n_quantiles)  # (B,N,H,Q)
+            return y
+        else:
+            return y_flat  # (B,N,H)
 
     # convenience getters
     def moe_aux_loss(self):
@@ -1019,6 +1035,19 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
 
     return _callback
 
+# ---------------- NEW: pinball loss for quantile regression ----------------
+def _pinball_loss(yq, y_true, q_list):
+    """
+    yq:     (B, N, H, Q)  predicted quantiles
+    y_true: (B, N, H)     target
+    q_list: list/tuple of quantiles in (0,1)
+    Returns scalar loss averaged over all dims.
+    """
+    qs = torch.tensor(q_list, device=yq.device, dtype=yq.dtype).view(1,1,1,-1)  # (1,1,1,Q)
+    diff = y_true.unsqueeze(-1) - yq                                           # (B,N,H,Q)
+    loss = torch.maximum(qs * diff, (qs - 1.0) * diff)                         # (B,N,H,Q)
+    return loss.mean()
+
 # ---------------- training/infer (unchanged API except eval callback) ----------------
 def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
     """
@@ -1047,7 +1076,7 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             weight_decay=WEIGHT_DECAY
         )
 
-    loss_fn = nn.MSELoss()
+    loss_fn_point = nn.MSELoss()
 
     for epoch in range(EPOCHS):
         model.train()
@@ -1062,10 +1091,14 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
                     xb = xb * (1.0 - drop_mask)
 
             opt.zero_grad()
-            pred = model(xb)                       # (B, N, H)
-            loss = loss_fn(pred, yb)
+            pred = model(xb)                       # (B, N, H) or (B, N, H, Q)
 
-            # ===== NEW: add MoE aux loss if present =====
+            if USE_QUANTILES:
+                loss = _pinball_loss(pred, yb, QUANTILES)
+            else:
+                loss = loss_fn_point(pred, yb)
+
+            # ===== add MoE aux loss if present =====
             aux = model.moe_aux_loss()
             if aux is not None:
                 loss = loss + W_MOE_AUX * aux
@@ -1097,10 +1130,16 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
 def infer(model, Xin):
     """
     Xin: (1, SEQ_LEN, N, F)
-    Returns: (1, N, H)
+    Returns: (1, N, H) point forecast by selecting a quantile (if enabled).
     """
     model.eval()
     out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
+    if USE_QUANTILES:
+        # (1, N, H, Q) -> select chosen quantile along last axis
+        qs = np.array(QUANTILES, dtype=float)
+        # pick index of quantile closest to PRED_QUANTILE
+        idx = int(np.argmin(np.abs(qs - float(PRED_QUANTILE))))
+        out = out[..., idx]  # (1, N, H)
     return out.cpu().numpy()
 
 # ---------------- pipeline helpers (train windows only) ----------------

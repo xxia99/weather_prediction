@@ -33,7 +33,7 @@ NLAYERS      = 2
 DROPOUT      = 0.1
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
-TRAIN_LAST_DAY = 80
+TRAIN_LAST_DAY = 85
 
 # --- Event-stratified validation options (mirrors StemGNN script) ---
 EVENT_METHOD   = "mean"   # or "max"

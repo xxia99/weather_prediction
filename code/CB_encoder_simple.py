@@ -10,11 +10,46 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
+from torch.optim.swa_utils import AveragedModel
+
+def _load_ckpt_flex(model: nn.Module, sd: dict, strict: bool = True) -> bool:
+    # 1) Try direct
+    try:
+        model.load_state_dict(sd, strict=strict)
+        return True
+    except Exception:
+        pass
+
+    # 2) If SWA wrapper and we were given a plain dict → load into .module
+    if isinstance(model, AveragedModel):
+        try:
+            model.module.load_state_dict(sd, strict=strict)
+            return True
+        except Exception:
+            pass
+
+    # 3) Strip "module." prefix + drop "n_averaged" and try again
+    if any(k.startswith("module.") for k in sd.keys()) or ("n_averaged" in sd):
+        sd_stripped = {k.replace("module.", "", 1): v for k, v in sd.items() if k != "n_averaged"}
+        try:
+            # Load either into wrapper.module (if SWA) or directly (if plain)
+            if isinstance(model, AveragedModel):
+                model.module.load_state_dict(sd_stripped, strict=strict)
+            else:
+                model.load_state_dict(sd_stripped, strict=strict)
+            return True
+        except Exception:
+            pass
+
+    # 4) Final fallback: be permissive
+    try:
+        model.load_state_dict(sd, strict=False)
+        return True
+    except Exception:
+        return False
 
 # ======================== config ========================
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_tcn_minimal_keepval_zinb/fix_gpu"
-os.makedirs(OUT_DIR, exist_ok=True)
 
 # core training
 SEQ_LEN       = 24
@@ -51,7 +86,7 @@ LAMBDA_BCE_ZERO    = 0.05        # small aux BCE(pi vs zero indicator) in phase 
 
 # surge-aware weighting (phase 2)
 SURGE_PRIOR_DEFAULT = 0.20       # fallback prior if not reading CSV
-SURGE_CSV_PATH      = None       # optional: path to surge_ranking_mean.csv with columns [day_index, level]
+SURGE_CSV_PATH      = "./results_surge/surge_ranking_mean.csv"       # optional: path to surge_ranking_mean.csv with columns [day_index, level]
 SURGE_LEVELS_STORM  = {"Severe", "Extreme"}
 W_SURGE             = 4.0        # upweight surge windows in phase 2
 
@@ -69,7 +104,7 @@ USE_SWA        = True
 SWA_START_FRAC = 0.75
 
 # day split + validation strategy (unchanged)
-TRAIN_LAST_DAY = 80
+TRAIN_LAST_DAY = 85
 EVENT_METHOD   = "mean"
 STORM_TOP_Q    = 0.80
 CALM_BOTTOM_Q  = 0.50
@@ -81,6 +116,8 @@ ZERO_EPS = 1e-8
 # inference choice
 INFER_POINT = "zinb_mean"   # "zinb_mean" | "quantile"
 
+OUT_DIR   = f"results_seq_tcn_minimal_keepval_zinb/fix_load_ckpt_{TRAIN_LAST_DAY}/surge_csv"
+os.makedirs(OUT_DIR, exist_ok=True)
 # =======================================================
 # utils
 # =======================================================
@@ -595,6 +632,13 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             best["rmse"] = sel_val
             best["epoch"] = epoch
             save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
+            if isinstance(model, AveragedModel):
+                sd_base = model.module.state_dict()  # plain keys (no 'module.')
+                sd_swa = model.state_dict()  # SWA wrapper keys ('module.' + 'n_averaged')
+            else:
+                sd_base = model.state_dict()
+                sd_swa = None
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -604,7 +648,8 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                     "rmse_calm": rmse_calm,
                     "rmse_storm": rmse_storm,
                     "best_by": str(BEST_BY).lower(),
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": sd_base,  # always present
+                    "model_state_dict_swa": sd_swa,  # present only if we saved from AveragedModel
                 },
                 save_path,
             )
@@ -994,11 +1039,24 @@ def main():
         best_path = os.path.join(OUT_DIR, f"best_enc-dec_{tag}.pt")
         if os.path.exists(best_path):
             ckpt = torch.load(best_path, map_location=DEVICE)
-            try:
-                model.load_state_dict(ckpt["model_state_dict"])
-                print(f"[{tag}] Loaded best checkpoint (epoch {ckpt.get('epoch')}, val-selected RMSE={ckpt.get('rmse_select', ckpt.get('rmse', float('nan'))):.4f})")
-            except Exception as e:
-                print(f"[{tag}] Warning: failed to load best checkpoint: {e}")
+            sd_base = ckpt.get("model_state_dict", {})
+            sd_swa = ckpt.get("model_state_dict_swa", None)
+
+            loaded = False
+            # Prefer SWA weights if the current model is an AveragedModel and SD exists
+            if isinstance(model, AveragedModel) and sd_swa is not None:
+                loaded = _load_ckpt_flex(model, sd_swa, strict=True)
+
+            # Otherwise fall back to the base dict
+            if not loaded and sd_base:
+                loaded = _load_ckpt_flex(model, sd_base, strict=True)
+
+            if loaded:
+                print(f"[{tag}] Loaded best checkpoint (epoch {ckpt.get('epoch')}, "
+                      f"val-selected RMSE={ckpt.get('rmse_select', ckpt.get('rmse', float('nan'))):.4f})")
+            else:
+                print(f"[{tag}] Warning: failed to load best checkpoint with flexible loader.")
+
         df_pred = predict_per_county(ds_train, model, scalers, H, ts_future)
         rmse = per_county_rmse_mean(df_truth, df_pred)
         print(f"[Test {tag}] RMSE={rmse:.4f} (all-zero RMSE={zero_rmse:.4f})")

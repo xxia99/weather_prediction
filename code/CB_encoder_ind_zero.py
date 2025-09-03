@@ -7,17 +7,18 @@ import xarray as xr
 import math
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
-# MoE layer
+# Mixture-of-experts layer
 from moe import MoE
 # (we no longer call event_stratified_report to avoid duplicate prints)
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-OUT_DIR   = "results_seq_mse_pre-CB_moe/sharp"
-# OUT_DIR   = "results_seq_mse_pre-patch_moe_daily/sharpe"
+OUT_DIR   = "results_seq_mse_pre-CB_moe/new"
+# OUT_DIR   = "results_seq_mse_pre-patch_moe/new"
 # OUT_DIR   = "results_seq_mse_non-pre/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -61,8 +62,9 @@ FREEZE_ENCODER          = False # fine-tune the encoder with the forecaster
 USE_CB_ENCODER          = True
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_H48.pt"
 # CB_ENCODER_CKPT         = "results_seq/pretrained_cb_encoder_peft_aug_100best.pt"  # your PEFT checkpoint path
-CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
+# CB_ENCODER_CKPT         = "results_lora_new/pretrained_cb_encoder_peft_independent_H24.pt"
 # CB_ENCODER_CKPT = "results_lora_variables-only/pretrained_cb_encoder_peft_independent_H24.pt"
+CB_ENCODER_CKPT = "results_lora/new/pretrained_cb_encoder_peft_independent_H24.pt"
 # === Day split for in-train validation (NEW) ===
 TRAIN_LAST_DAY = 80   # use days 1..80 for training; 81..end for validation
 
@@ -79,6 +81,19 @@ ZERO_EPS = 1e-8  # numerical tolerance for "zero" vs "nonzero"
 OUTAGE_THRESHOLD = 0.5      # base outage threshold
 AUTO_TUNE_THRESHOLD = True  # auto-search threshold on validation
 ZERO_FP_WEIGHT = 2.0        # weight when truth is zero
+
+# --- Oversampling & augmentations ---
+STORMY_OVERSAMPLE = 3.0     # sampling weight for stormy windows
+CALM_OVERSAMPLE   = 2.0     # oversample calm/negative windows
+NOISE_AUG_PROB    = 0.3     # probability of applying noise perturbation
+NOISE_AUG_STD     = 0.01    # std of Gaussian noise
+CLS_LOSS_WEIGHT   = 0.1     # weight for outage occurrence classification
+QUANTILE_LOSS_WEIGHT = 0.05 # weight for spike quantile loss
+QUANTILE_TAU      = 0.9     # high quantile for spike residuals
+
+# --- Temporal smoothing & storm indicators ---
+SMOOTH_WINDOW     = 3       # moving-average window for output smoothing
+STORM_IND_THRESH  = 1.0     # gradient magnitude threshold for storm indicator
 
 # ---------------- utils (unchanged) ----------------
 def open_ds(path):
@@ -99,6 +114,20 @@ def zfit(arr):
 
 def zapply(arr, mu, sd):
     return (arr - mu) / sd
+
+def augment_weather_features(w):
+    """Add gradient, rolling mean, and storm indicator features."""
+    T, N, F = w.shape
+    # temporal gradient
+    grad = np.concatenate([np.zeros((1, N, F)), np.diff(w, axis=0)], axis=0)
+    # rolling mean with window=3
+    roll = np.zeros_like(w)
+    for t in range(T):
+        start = max(0, t - 2)
+        roll[t] = w[start:t+1].mean(axis=0)
+    # storm indicator: max abs gradient over features exceeds threshold
+    storm = (np.abs(grad).max(axis=2, keepdims=True) > STORM_IND_THRESH).astype(float)
+    return np.concatenate([w, grad, roll, storm], axis=2)
 
 def build_windows(X_loc, y_loc, seq_len, horizon):
     """
@@ -428,27 +457,44 @@ class STGNNForecaster(nn.Module):
             )
             d_in = STEM_D_MODEL
         self.blocks = nn.ModuleList(blocks)
-        self.readout = MoE(
+        # location embeddings added after encoder
+        self.loc_emb = nn.Embedding(num_nodes, enc_out_dim)
+        # rate head for magnitude (Poisson intensity)
+        self.rate_head = MoE(
             STEM_D_MODEL,
             horizon,
             num_experts=MOE_EXPERTS,
             hidden_dim=2 * STEM_D_MODEL,
             dropout=STEM_DROPOUT,
         )
+        # classification and spike residual heads
+        self.event_head = nn.Linear(STEM_D_MODEL, horizon)
+        self.spike_head = nn.Linear(STEM_D_MODEL, horizon)
 
-    def forward(self, x):
-        # x: (B, T, N, F)
-        B, T, N, F = x.shape
-        assert N == self.num_nodes and F == self.in_channels, \
-            f"StemGNN input shape mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
+    def forward(self, x, return_components: bool = False):
+        # x: (B, T, N, C)
+        B, T, N, C = x.shape
+        assert N == self.num_nodes and C == self.in_channels, \
+            f"StemGNN input shape mismatch: got N={N},F={C}, expected N={self.num_nodes},F={self.in_channels}"
 
         h = self.patch(x)
+        emb = self.loc_emb(torch.arange(N, device=x.device))  # (N, D)
+        h = h + emb.unsqueeze(0).unsqueeze(0)
         for blk in self.blocks:
             h = blk(h)
-        # pooled = h.mean(dim=1)      # (B, N, STEM_D_MODEL)
-        # y = self.readout(pooled)    # (B, N, H)
-        last = h[:, -1]  # (B, N, D) if h is (B, T, N, D)
-        y = self.readout(last)
+        last = h[:, -1]  # (B, N, D)
+        rate = F.softplus(self.rate_head(last))          # (B, N, H)
+        logits = self.event_head(last)                   # (B, N, H)
+        spike = self.spike_head(last)                    # (B, N, H)
+        prob = torch.sigmoid(logits)
+        mag = rate + F.relu(spike)
+        y = prob * mag
+        if SMOOTH_WINDOW > 1:
+            y = y.view(B * N, 1, self.horizon)
+            y = F.avg_pool1d(y, kernel_size=SMOOTH_WINDOW, stride=1, padding=SMOOTH_WINDOW // 2)
+            y = y.view(B, N, self.horizon)
+        if return_components:
+            return y, logits, prob, mag, rate, spike
         return y
 
 # ---------------- helpers for day split & windows (NEW) ----------------
@@ -484,16 +530,24 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
       aux: dict with arrays used for validation (scaled series, timestamps, etc.)
     """
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)                 # (T, N)
-    w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    w_raw = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float) # (T, N, F)
+    if USE_CB_ENCODER:
+        # The CB encoder is pretrained on the original 109 weather features;
+        # avoid augmenting to keep the channel dimension at 110 (=1 + 109).
+        w = w_raw
+    else:
+        # For other encoders we can enrich inputs with gradients, rolling means,
+        # and a storm indicator to provide additional context.
+        w = augment_weather_features(w_raw)
     ts = pd.to_datetime(ds_train.timestamp.values)
     days, uniq_days, day_end_idx = _compute_day_indices(ts)
-    T, N, F = w.shape
-    Din = 1 + F
+    T, N, F_tot = w.shape
+    Din = 1 + F_tot
 
     scalers = _fit_scalers_train_only(y, w, days, train_last_day)
 
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)       # (T, N)
-    w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)    # (T, N, F)
+    w_sc = zapply(w.reshape(-1, F_tot), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F_tot)    # (T, N, F_tot)
     X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)                               # (T, N, Din)
 
     N_total = T - SEQ_LEN - horizon + 1
@@ -504,18 +558,24 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
     # --- per-county windows, concatenated on batch axis; set N=1 ---
-    X_list, Y_list = [], []
+    X_list, Y_list, W_list = [], [], []
     for node in range(N):
         x_loc_full = X_all[:, node, :]                             # (T, Din)
         Xw, Yw = build_windows(x_loc_full, y_sc[:, node], SEQ_LEN, horizon)  # (N_total, SEQ_LEN, Din), (N_total, H)
         if len(Xw):
-            X_list.append(Xw[:N_train][:, :, None, :])  # -> (nW, SEQ_LEN, 1, Din)
-            Y_list.append(Yw[:N_train][:, None, :])     # -> (nW, 1, H)
+            X_sel = Xw[:N_train][:, :, None, :]
+            Y_sel = Yw[:N_train][:, None, :]
+            storm_mask = (Y_sel.reshape(Y_sel.shape[0], -1).max(axis=1) > OUTAGE_THRESHOLD)
+            W_sel = np.where(storm_mask, STORMY_OVERSAMPLE, CALM_OVERSAMPLE)
+            X_list.append(X_sel)
+            Y_list.append(Y_sel)
+            W_list.append(W_sel)
 
     if not X_list:
         raise RuntimeError("No training windows after split; check SEQ_LEN/horizon/TRAIN_LAST_DAY.")
     X_tr = np.concatenate(X_list, axis=0)  # (nW*N, SEQ_LEN, 1, Din)
     Y_tr = np.concatenate(Y_list, axis=0)  # (nW*N, 1, H)
+    W_tr = np.concatenate(W_list, axis=0)  # (nW*N,)
 
     aux = {
         "X_all_scaled": X_all,     # (T, N, Din)
@@ -524,7 +584,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=80):
         "days": days,              # (T,)
         "day_end_idx": day_end_idx # list[int]
     }
-    return X_tr, Y_tr, Din, scalers, aux
+    return X_tr, Y_tr, Din, scalers, aux, W_tr
 
 # ---------------- validation roll (NEW) ----------------
 @torch.no_grad()
@@ -1002,16 +1062,25 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
     return _callback
 
 # ---------------- training/infer (unchanged API except eval callback) ----------------
-def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
+def quantile_loss(pred, target, tau):
+    diff = target - pred
+    return torch.mean(torch.maximum(tau * diff, (tau - 1) * diff))
+
+def train_model(X, Y, W, din, horizon, n_nodes, eval_callback=None):
     """
     X: (num_samples, SEQ_LEN, N, din)
     Y: (num_samples, N, horizon)
+    W: optional sampling weights per sample
     """
     if len(X) == 0:
         return None
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
                        torch.tensor(Y, dtype=torch.float32))
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    if W is not None:
+        sampler = WeightedRandomSampler(torch.tensor(W, dtype=torch.double), num_samples=len(W), replacement=True)
+        dl = DataLoader(ds, batch_size=BATCH_SIZE, sampler=sampler)
+    else:
+        dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
     model = STGNNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
 
     enc_params = list(model.patch.parameters())
@@ -1029,26 +1098,39 @@ def train_model(X, Y, din, horizon, n_nodes, eval_callback=None):
             weight_decay=WEIGHT_DECAY
         )
 
-    def weighted_mse(pred, target):
-        weights = torch.ones_like(target)
-        weights = torch.where(target <= ZERO_EPS, ZERO_FP_WEIGHT, 1.0)
-        return torch.mean((pred - target) ** 2 * weights)
+    bce = nn.BCEWithLogitsLoss()
 
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0.0
         start_time = time.time()
         for xb, yb in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)  # xb: (B, T, N, F), yb: (B, N, H)
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
 
             if TEMPORAL_DROP_PROB > 0.0:
                 with torch.no_grad():
                     drop_mask = (torch.rand(xb.size(0), xb.size(1), 1, 1, device=xb.device) < TEMPORAL_DROP_PROB).float()
                     xb = xb * (1.0 - drop_mask)
 
+            if NOISE_AUG_PROB > 0.0:
+                neg_mask = (yb.max(dim=2)[0] <= OUTAGE_THRESHOLD).squeeze(1)
+                rand_mask = (torch.rand(neg_mask.shape[0], device=xb.device) < NOISE_AUG_PROB) & neg_mask
+                if rand_mask.any():
+                    xb[rand_mask] = xb[rand_mask] + NOISE_AUG_STD * torch.randn_like(xb[rand_mask])
+
             opt.zero_grad()
-            pred = model(xb)                       # (B, N, H)
-            loss = weighted_mse(pred, yb)
+            pred, logits, prob, mag, rate, spike = model(xb, return_components=True)
+            cls_target = (yb > OUTAGE_THRESHOLD).float()
+            loss_cls = bce(logits, cls_target)
+            pos_mask = cls_target.bool()
+            if pos_mask.any():
+                loss_mag = F.poisson_nll_loss(mag[pos_mask] + 1e-8, yb[pos_mask], log_input=False)
+                residual = F.relu(yb[pos_mask] - rate[pos_mask])
+                loss_q = quantile_loss(F.relu(spike[pos_mask]), residual, QUANTILE_TAU)
+            else:
+                loss_mag = torch.tensor(0.0, device=xb.device)
+                loss_q = torch.tensor(0.0, device=xb.device)
+            loss = loss_mag + CLS_LOSS_WEIGHT * loss_cls + QUANTILE_LOSS_WEIGHT * loss_q
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
@@ -1075,8 +1157,8 @@ def infer(model, Xin):
 
 # ---------------- pipeline helpers (train windows only) ----------------
 def prepare_training(ds_train, horizon):
-    X, Y, Din, scalers, aux = prepare_training_split(ds_train, horizon, TRAIN_LAST_DAY)
-    return X, Y, Din, scalers, aux
+    X, Y, Din, scalers, aux, W = prepare_training_split(ds_train, horizon, TRAIN_LAST_DAY)
+    return X, Y, Din, scalers, aux, W
 
 # ---------------- test-time prediction (updated for N=1 inference) ----------------
 def predict_per_county(ds_train, model, scalers, horizon, ts_future):
@@ -1176,22 +1258,22 @@ def main():
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
     # ==== 24h ====
-    X24, Y24, Din, scalers24, aux24 = prepare_training(ds_train, horizon=H24)
+    X24, Y24, Din, scalers24, aux24, W24 = prepare_training(ds_train, horizon=H24)
     n_nodes = 1  # <<< single-node per sample
     val_cb24 = make_val_callback_rolling(
         ds_train, scalers24, H24, aux24, label="24h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24
     )
-    mdl24 = train_model(X24, Y24, Din, H24, n_nodes, eval_callback=val_cb24)
+    mdl24 = train_model(X24, Y24, W24, Din, H24, n_nodes, eval_callback=val_cb24)
     # mdl24 = None
 
     # ==== 48h ====
-    X48, Y48, _, scalers48, aux48 = prepare_training(ds_train, horizon=H48)
+    X48, Y48, _, scalers48, aux48, W48 = prepare_training(ds_train, horizon=H48)
     val_cb48 = make_val_callback_rolling(
         ds_train, scalers48, H48, aux48, label="48h", train_last_day=TRAIN_LAST_DAY,
         ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48
     )
-    mdl48 = train_model(X48, Y48, Din, H48, n_nodes, eval_callback=val_cb48)
+    mdl48 = train_model(X48, Y48, W48, Din, H48, n_nodes, eval_callback=val_cb48)
 
     # ----- Test evaluation using best models, then write CSVs -----
     # 24h

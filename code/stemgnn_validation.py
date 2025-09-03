@@ -35,7 +35,7 @@ STEM_D_EMB    = 32     # node embedding dim (for adaptive adjacency)
 STEM_DROPOUT  = 0.05
 
 # === NEW: day split for in-train validation (train on days 1..80, validate on the rest) ===
-TRAIN_LAST_DAY = 80
+TRAIN_LAST_DAY = 85
 
 # Event evaluation settings
 EVENT_METHOD   = "mean"

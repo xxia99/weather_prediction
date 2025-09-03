@@ -17,7 +17,7 @@ OUT_DIR = "results_sarima/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Day split: train on days 1..80, validate (rolling day-ahead) on the rest
-TRAIN_LAST_DAY = 80  # mirrors other scripts
+TRAIN_LAST_DAY = 85  # mirrors other scripts
 
 # Event-stratified evaluation settings
 EVENT_METHOD   = "mean"   # or "max"
