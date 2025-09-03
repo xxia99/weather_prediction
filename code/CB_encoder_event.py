@@ -1134,11 +1134,13 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     y = ds_train.out.transpose("timestamp", "location").values.astype(float)
     w = ds_train.weather.transpose("timestamp", "location", "feature").values.astype(float)
     T, N, F = w.shape
-    Din = 1 + F
-
     y_sc = zapply(y.reshape(-1, 1), scalers["y_mu"], scalers["y_sd"]).reshape(T, N)
     w_sc = zapply(w.reshape(-1, F), scalers["w_mu"], scalers["w_sd"]).reshape(T, N, F)
-    X_all = np.concatenate([y_sc[..., None], w_sc], axis=2)
+    # replicate training-time feature engineering: append first differences
+    w_diff = np.diff(w_sc, axis=0, prepend=w_sc[:1])
+    w_fe = np.concatenate([w_sc, w_diff], axis=2)
+    Din = 1 + w_fe.shape[2]
+    X_all = np.concatenate([y_sc[..., None], w_fe], axis=2)
 
     rows = []
     for i, county in enumerate(locs):
