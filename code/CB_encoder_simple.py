@@ -66,6 +66,10 @@ TCN_DROPOUT   = 0.15
 TCN_KSIZE     = 3
 TCN_LEVELS    = 4            # dilations: 1,2,4,8
 
+# --- County-specific MoE (minimal add) ---
+NUM_EXPERTS     = 8          # small K; tune 4–8 if desired
+COUNTY_EMB_DIM  = 16         # small embedding for counties
+
 # heads / objectives
 USE_ZINB_HEAD      = True         # added head: predicts (pi, mu, theta)
 KEEP_QUANTILES     = True         # keep quantile head for RMSE alignment and diagnostics
@@ -109,14 +113,14 @@ EVENT_METHOD   = "mean"
 STORM_TOP_Q    = 0.80
 CALM_BOTTOM_Q  = 0.50
 CALM_N         = 10
-BEST_BY        = "overall"
+BEST_BY        = "calm"
 
 ZERO_EPS = 1e-8
 
 # inference choice
 INFER_POINT = "zinb_mean"   # "zinb_mean" | "quantile"
 
-OUT_DIR   = f"results_seq_tcn_minimal_keepval_zinb/fix_load_ckpt_{TRAIN_LAST_DAY}/surge_csv"
+OUT_DIR   = f"results_MoE/per_county_{TRAIN_LAST_DAY}/{BEST_BY}"
 os.makedirs(OUT_DIR, exist_ok=True)
 # =======================================================
 # utils
@@ -175,7 +179,11 @@ def _update_bn_on_device(loader, model, device):
             module.momentum = momentum
         with torch.no_grad():
             x = x.to(device, non_blocking=True)
-            model(x)
+            # --- pass a dummy county id of zeros for BN-only refresh ---
+            if isinstance(x, (list, tuple)):
+                model(x[0], torch.zeros(x[0].size(0), dtype=torch.long, device=device))
+            else:
+                model(x, torch.zeros(x.size(0), dtype=torch.long, device=device))
         n += b
 
     # restore original BN momenta
@@ -184,7 +192,7 @@ def _update_bn_on_device(loader, model, device):
 
 
 # =======================================================
-# TCN forecaster (minimal backbone) + dual heads
+# TCN forecaster (minimal backbone) + dual heads + county MoE
 # =======================================================
 def _causal_conv1d(x, conv, dilation, ksize):
     # x: (B*N, C, T)
@@ -215,15 +223,43 @@ class _TCNBlock(nn.Module):
         y = self.drop(y)
         return y + self.res(x)
 
+# --- minimal County-specific MoE bottleneck ---
+class CountyMoE(nn.Module):
+    def __init__(self, in_dim: int, num_counties: int, num_experts: int, emb_dim: int, dropout: float):
+        super().__init__()
+        self.emb = nn.Embedding(num_counties, emb_dim)
+        self.gate = nn.Linear(in_dim + emb_dim, num_experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_dim + emb_dim, in_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, h_last: torch.Tensor, county_ids: torch.Tensor):
+        """
+        h_last: (B*N, C)
+        county_ids: (B*N,) long
+        """
+        e = self.emb(county_ids)                           # (B*N, E)
+        z = torch.cat([h_last, e], dim=-1)                # (B*N, C+E)
+        logits = self.gate(z)                              # (B*N, K)
+        gates  = torch.softmax(logits, dim=-1)            # (B*N, K)
+        exp_outs = torch.stack([exp(z) for exp in self.experts], dim=1)  # (B*N, K, C)
+        mixed = torch.sum(gates.unsqueeze(-1) * exp_outs, dim=1)         # (B*N, C)
+        return mixed, gates
+
 class TCNForecaster(nn.Module):
     """
-    Input:  (B, T, N, F)
+    Input:  x  (B, T, N, F)  with N==1 in current pipeline
+            county_ids (B,)   county index for each sample (from ds_train.location order)
     Output: dict {
         "q": (B, N, H, Q)  if KEEP_QUANTILES else None,
         "zinb": (logit_pi, raw_mu, raw_theta) each (B, N, H) if USE_ZINB_HEAD
     }
     """
-    def __init__(self, in_channels, horizon, num_nodes):
+    def __init__(self, in_channels, horizon, num_nodes, num_counties, num_experts, emb_dim):
         super().__init__()
         self.num_nodes   = num_nodes
         self.horizon     = horizon
@@ -238,7 +274,14 @@ class TCNForecaster(nn.Module):
             layers.append(_TCNBlock(c, c, ksize=TCN_KSIZE, dilation=dil, dropout=TCN_DROPOUT))
         self.tcn = nn.Sequential(*layers)
 
-        # heads
+        # --- MoE bottleneck conditioned on county ---
+        self.moe = CountyMoE(in_dim=TCN_D_MODEL,
+                             num_counties=num_counties,
+                             num_experts=num_experts,
+                             emb_dim=emb_dim,
+                             dropout=TCN_DROPOUT)
+
+        # heads (unchanged), now consume MoE-mixed representation
         if KEEP_QUANTILES:
             out_q = horizon * len(QUANTILES)
             self.head_q = nn.Sequential(
@@ -251,7 +294,6 @@ class TCNForecaster(nn.Module):
             self.head_q = None
 
         if USE_ZINB_HEAD:
-            # 3 * H (logit_pi, raw_mu, raw_theta) — we apply activations in loss/infer
             self.head_zinb = nn.Sequential(
                 nn.Linear(TCN_D_MODEL, TCN_D_MODEL),
                 nn.GELU(),
@@ -261,25 +303,33 @@ class TCNForecaster(nn.Module):
         else:
             self.head_zinb = None
 
-    def forward(self, x):
+    def forward(self, x, county_ids: torch.Tensor):
         B, T, N, F = x.shape
         assert N == self.num_nodes and F == self.in_channels, \
             f"TCN input mismatch: got N={N},F={F}, expected N={self.num_nodes},F={self.in_channels}"
-
         # (B,T,N,F) -> (B*N, T, F) -> project -> (B*N, C, T)
         x = x.permute(0,2,1,3).contiguous().view(B*N, T, F)
         x = self.in_proj(x)                     # (B*N, T, C)
         x = x.permute(0,2,1).contiguous()      # (B*N, C, T)
 
-        h = self.tcn(x)                         # (B*N, C, T)
-        h_last = h[:, :, -1]                    # (B*N, C)
+        h = self.tcn(x)                        # (B*N, C, T)
+        h_last = h[:, :, -1]                   # (B*N, C)
+
+        # county-specific MoE mix
+        if county_ids is None:
+            county_ids = torch.zeros(B*N, dtype=torch.long, device=h_last.device)
+        else:
+            if county_ids.dim() == 1 and county_ids.size(0) == B:
+                # expand to B*N when N==1 (current pipeline)
+                county_ids = county_ids.view(B, 1).expand(B, N).reshape(B*N)
+        h_mixed, _ = self.moe(h_last, county_ids)   # (B*N, C)
 
         out = {"q": None, "zinb": None}
         if self.head_q is not None:
-            yq = self.head_q(h_last).view(B, N, self.horizon, len(QUANTILES))
+            yq = self.head_q(h_mixed).view(B, N, self.horizon, len(QUANTILES))
             out["q"] = yq
         if self.head_zinb is not None:
-            z = self.head_zinb(h_last).view(B, N, self.horizon, 3)
+            z = self.head_zinb(h_mixed).view(B, N, self.horizon, 3)
             logit_pi = z[..., 0]     # zero-inflation probability (π) logits
             raw_mu   = z[..., 1]     # to softplus -> μ > 0
             raw_th   = z[..., 2]     # to softplus -> θ > 0
@@ -345,7 +395,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
     day_last_idx = day_end_idx[train_last_day - 1]
     N_train = max(0, day_last_idx - SEQ_LEN - horizon + 1)
 
-    X_list, Y_sc_list, Y_raw_list = [], [], []
+    X_list, Y_sc_list, Y_raw_list, CID_list = [], [], [], []  # --- collect county ids ---
     for node in range(N):
         x_loc_full = X_all[:, node, :]
         Xw_sc, Yw_sc = build_windows(x_loc_full, y_sc[:, node], SEQ_LEN, horizon)
@@ -355,12 +405,15 @@ def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
             X_list.append(Xw_sc[:N_train][:, :, None, :])      # (nW, SEQ_LEN, 1, Din)
             Y_sc_list.append(Yw_sc[:N_train][:, None, :])      # (nW, 1, H)
             Y_raw_list.append(Yw_raw[:N_train][:, None, :])    # (nW, 1, H) raw counts
+            # county id repeated per window
+            CID_list.append(np.full((min(N_train, Xw_sc.shape[0]),), node, dtype=np.int64))
 
     if not X_list:
         raise RuntimeError("No training windows after split; check SEQ_LEN/horizon/TRAIN_LAST_DAY.")
     X_tr    = np.concatenate(X_list, axis=0)
     Y_tr_sc = np.concatenate(Y_sc_list, axis=0)
     Y_tr_rw = np.concatenate(Y_raw_list, axis=0)
+    CIDs    = np.concatenate(CID_list, axis=0)                 # (num_samples,)
 
     # surge flags/weights based on raw future maxima
     storm_prior = _load_storm_prior(SURGE_CSV_PATH, train_last_day=train_last_day)
@@ -378,7 +431,7 @@ def prepare_training_split(ds_train, horizon, train_last_day=TRAIN_LAST_DAY):
         "storm_prior": float(storm_prior),
         "surge_thr_raw": float(thr),
     }
-    return X_tr, Y_tr_sc, Y_tr_rw, W_tr, is_surge, Din, scalers, aux
+    return X_tr, Y_tr_sc, Y_tr_rw, W_tr, is_surge, Din, scalers, aux, CIDs
 
 # =======================================================
 # validation roll (full pipeline preserved)
@@ -406,7 +459,7 @@ def predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day=TRAI
         ts_future = pd.to_datetime(ts[fut_start:fut_start+horizon])
         for i, county in enumerate(locs):
             Xin_i = X_all[start_ctx:end_idx+1, i, :].reshape(1, SEQ_LEN, 1, X_all.shape[2])
-            pred_sc = infer(model, Xin_i, scalers)[0, 0]  # (H,)
+            pred_sc = infer(model, Xin_i, scalers, county_id=i)[0, 0]  # (H,)
             pred = np.clip(np.nan_to_num(pred_sc, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
             rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
 
@@ -448,6 +501,87 @@ def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:
         "pred": 0.0
     })
     return per_county_rmse_mean(df_truth_wide, df_zero_long)
+
+def _per_county_rmse_table_and_plots(df_truth_wide: pd.DataFrame,
+                                     df_pred_long: pd.DataFrame,
+                                     out_dir: str,
+                                     epoch: int,
+                                     label: str):
+    """
+    Computes RMSE per county and saves:
+      - a CSV of per-county RMSEs
+      - a figure per county (truth vs pred over time)
+    """
+    if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
+        return
+
+    # Align truth (wide) and pred (long→wide) on common timestamps and locations
+    df_t = df_truth_wide.copy()
+    df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
+    tw = df_t.set_index("timestamp").sort_index()
+
+    df_p = df_pred_long.copy()
+    df_p["timestamp"] = pd.to_datetime(df_p["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_p["location"]  = df_p["location"].astype(str)
+    df_p = df_p.dropna(subset=["timestamp", "location"])
+    df_p = df_p.groupby(["timestamp", "location"], as_index=False, sort=False)["pred"].mean()
+    pw = df_p.pivot_table(index="timestamp", columns="location", values="pred", aggfunc="mean").sort_index()
+
+    common_ts = tw.index.intersection(pw.index)
+    if len(common_ts) == 0:
+        return
+    tw = tw.loc[common_ts]
+    pw = pw.loc[common_ts]
+
+    locs = sorted(set(tw.columns).intersection(pw.columns))
+    if len(locs) == 0:
+        return
+
+    # Compute RMSE per county
+    rows = []
+    for loc in locs:
+        y_true = tw[loc].to_numpy()
+        y_pred = pw[loc].to_numpy()
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if not np.any(mask):
+            continue
+        rmse = float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
+        rows.append({"location": loc, "rmse": rmse})
+    if not rows:
+        return
+    df_rmse = pd.DataFrame(rows).sort_values("rmse").reset_index(drop=True)
+
+    # Save per-county RMSE CSV
+    csv_path = os.path.join(out_dir, f"val_per_county_rmse_epoch{epoch}_{label}.csv")
+    df_rmse.to_csv(csv_path, index=False)
+    print(f"[Val {label}] Saved per-county RMSE table: {csv_path}")
+
+    # One figure per county (truth vs pred)
+    for loc in locs:
+        y_true = tw[loc]
+        y_pred = pw[loc]
+        common = y_true.index.intersection(y_pred.index)
+        if len(common) == 0:
+            continue
+        df_plot = pd.DataFrame({
+            "timestamp": common,
+            "truth": y_true.loc[common].values,
+            "pred": y_pred.loc[common].values
+        }).sort_values("timestamp")
+
+        safe_loc = str(loc).replace("/", "-").replace("\\", "-").replace(" ", "_")
+        fig_path = os.path.join(out_dir, f"val_curve_epoch{epoch}_{label}_county_{safe_loc}.png")
+        plt.figure(figsize=(8, 3))
+        plt.plot(df_plot["timestamp"], df_plot["truth"], label="Truth")
+        plt.plot(df_plot["timestamp"], df_plot["pred"], label="Prediction")
+        plt.title(f"{label} - {loc}")
+        plt.xlabel("timestamp"); plt.ylabel("outage")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(fig_path)
+        plt.close()
+    print(f"[Val {label}] Saved county-wise figures to: {out_dir}")
 
 def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame, eps: float = ZERO_EPS):
     if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
@@ -685,6 +819,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                 plt.close(fig)
                 print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
 
+                # --- NEW: county-wise RMSE table + plots ---
+            _per_county_rmse_table_and_plots(df_truth_val, df_pred_val, OUT_DIR, epoch, label)
+
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
             rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
@@ -848,18 +985,25 @@ def _maybe_apply_augments(xb, is_surge_batch):
 # =======================================================
 # training / inference
 # =======================================================
-def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, eval_callback=None):
+def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, eval_callback=None, county_ids=None, num_counties=None):
     if len(X) == 0:
         return None
+
+    if county_ids is None:
+        raise RuntimeError("county_ids must be provided for county-specific MoE.")
 
     ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
                        torch.tensor(Y_sc, dtype=torch.float32),
                        torch.tensor(Y_rw, dtype=torch.float32),
                        torch.tensor(W, dtype=torch.float32),
-                       torch.tensor(is_surge_all, dtype=torch.float32))
+                       torch.tensor(is_surge_all, dtype=torch.float32),
+                       torch.tensor(county_ids, dtype=torch.long))
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
-    model = TCNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes).to(DEVICE)
+    # num_counties comes from ds_train.location size
+    model = TCNForecaster(in_channels=din, horizon=horizon, num_nodes=n_nodes,
+                          num_counties=int(num_counties),
+                          num_experts=NUM_EXPERTS, emb_dim=COUNTY_EMB_DIM).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
 
@@ -876,18 +1020,19 @@ def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, 
         epoch_loss = 0.0
 
         in_phase1 = (epoch < PHASE1_EPOCHS)
-        for xb, y_sc, y_rw, wb, is_surge_b in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
+        for xb, y_sc, y_rw, wb, is_surge_b, cid in tqdm(dl, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
             xb = xb.to(DEVICE)
             y_sc = y_sc.to(DEVICE)      # scaled (for quantiles)
             y_rw = y_rw.to(DEVICE)      # raw   (for ZINB)
             wb = wb.to(DEVICE)          # sample weights
             is_surge_b = is_surge_b.to(DEVICE)
+            cid = cid.to(DEVICE)        # (B,)
 
             if AUG_ENABLE:
                 xb = _maybe_apply_augments(xb, is_surge_b)
 
             opt.zero_grad()
-            out = model(xb)
+            out = model(xb, cid)
             loss = 0.0
 
             # ----- Phase 1: fit trend (NB mean or median quantile) -----
@@ -947,9 +1092,15 @@ def train_model(X, Y_sc, Y_rw, W, is_surge_all, din, horizon, n_nodes, scalers, 
     return model
 
 @torch.no_grad()
-def infer(model, Xin, scalers):
+def infer(model, Xin, scalers, county_id: int):
     model.eval()
-    out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE))
+    # pack county ids for batch size 1
+    if isinstance(Xin, np.ndarray):
+        B = Xin.shape[0]
+    else:
+        B = Xin.size(0)
+    cid = torch.full((B,), int(county_id), dtype=torch.long, device=DEVICE)
+    out = model(torch.tensor(Xin, dtype=torch.float32).to(DEVICE), cid)
     # Return *original-scale* predictions for RMSE alignment
     if INFER_POINT == "zinb_mean" and out["zinb"] is not None:
         logit_pi, raw_mu, raw_th = out["zinb"]
@@ -993,7 +1144,7 @@ def predict_per_county(ds_train, model, scalers, horizon, ts_future):
     rows = []
     for i, county in enumerate(locs):
         Xin_i = X_all[-SEQ_LEN:, i, :].reshape(1, SEQ_LEN, 1, Din)
-        pred = infer(model, Xin_i, scalers)[0, 0]   # already original scale if ZINB; else unscaled above
+        pred = infer(model, Xin_i, scalers, county_id=i)[0, 0]   # already original scale if ZINB; else unscaled above
         pred = np.clip(np.nan_to_num(pred, nan=0.0, posinf=None, neginf=0.0), 0.0, None)
         rows.append(pd.DataFrame({"timestamp": ts_future, "location": county, "pred": pred.astype(float)}))
     return pd.concat(rows, ignore_index=True)
@@ -1018,21 +1169,24 @@ def main():
     zero_rmse_48 = _all_zero_rmse_for_truth(df_t48)
 
     # ---- Prepare once
-    X24, Y24_sc, Y24_rw, W24, S24, Din, scalers24, aux24 = prepare_training_split(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
-    X48, Y48_sc, Y48_rw, W48, S48, _,   scalers48, aux48  = prepare_training_split(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
+    X24, Y24_sc, Y24_rw, W24, S24, Din, scalers24, aux24, CIDs24 = prepare_training_split(ds_train, horizon=H24, train_last_day=TRAIN_LAST_DAY)
+    X48, Y48_sc, Y48_rw, W48, S48, _,   scalers48, aux48,  CIDs48 = prepare_training_split(ds_train, horizon=H48, train_last_day=TRAIN_LAST_DAY)
     n_nodes = 1
+    num_counties = len(ds_train.location.values)
 
     # ---- 24h
     val_cb24 = make_val_callback_rolling(ds_train, scalers24, H24, aux24, label="24h",
                                          train_last_day=TRAIN_LAST_DAY,
                                          ts_future_test=ts24, df_truth_test=df_t24, zero_rmse_test=zero_rmse_24)
-    mdl24 = train_model(X24, Y24_sc, Y24_rw, W24, S24, Din, H24, n_nodes, scalers24, eval_callback=val_cb24)
+    mdl24 = train_model(X24, Y24_sc, Y24_rw, W24, S24, Din, H24, n_nodes, scalers24,
+                        eval_callback=val_cb24, county_ids=CIDs24, num_counties=num_counties)
 
     # ---- 48h
     val_cb48 = make_val_callback_rolling(ds_train, scalers48, H48, aux48, label="48h",
                                          train_last_day=TRAIN_LAST_DAY,
                                          ts_future_test=ts48, df_truth_test=df_t48, zero_rmse_test=zero_rmse_48)
-    mdl48 = train_model(X48, Y48_sc, Y48_rw, W48, S48, Din, H48, n_nodes, scalers48, eval_callback=val_cb48)
+    mdl48 = train_model(X48, Y48_sc, Y48_rw, W48, S48, Din, H48, n_nodes, scalers48,
+                        eval_callback=val_cb48, county_ids=CIDs48, num_counties=num_counties)
 
     # ----- Final test with best checkpoint if present -----
     def _finalize(model, scalers, H, ts_future, df_truth, tag, zero_rmse):

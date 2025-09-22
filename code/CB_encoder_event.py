@@ -1,4 +1,5 @@
 import os
+
 GLOBAL_SEED = 3  # === SEEDING: set your global seed here ===
 # Make hashing & some CUDA matmuls deterministic as early as possible (before importing torch)
 os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
@@ -58,10 +59,12 @@ TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
 
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
-# OUT_DIR   = "results_seq_mse_pre-CB_use-moe/update_restore_best"
-OUT_DIR   = f"results_seq_mse_pre-CB_contrastive_use-moe/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
-# OUT_DIR   = "results_seq_mse_pre-patch_use-moe"
-# OUT_DIR   = "results_seq_mse_non-pre-patch_use-moe/2experts"
+BEST_BY        = "overall"  # "overall" | "calm" | "storm"
+OUT_DIR   = f"results_CB/per_county_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}_{BEST_BY}"
+# OUT_DIR   = f"results_non-pre-CB/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
+# OUT_DIR   = f"results_pre-patch/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
+# OUT_DIR   = f"results_non-pre-patch/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Pretrained encoder options
@@ -85,7 +88,6 @@ EVENT_METHOD   = "mean"
 STORM_TOP_Q    = 0.80
 CALM_BOTTOM_Q  = 0.50
 CALM_N         = 10
-BEST_BY        = "overall"  # "overall" | "calm" | "storm"
 
 # Zero/nonzero diag
 ZERO_EPS = 1e-8
@@ -161,6 +163,87 @@ def build_windows(X_loc, y_loc, seq_len, horizon):
         Xw.append(X_loc[i:i+seq_len])
         Yw.append(y_loc[i+seq_len:i+seq_len+horizon])
     return np.asarray(Xw, dtype=float), np.asarray(Yw, dtype=float)
+
+def _per_county_rmse_table_and_plots(df_truth_wide: pd.DataFrame,
+                                     df_pred_long: pd.DataFrame,
+                                     out_dir: str,
+                                     epoch: int,
+                                     label: str):
+    """
+    Computes RMSE per county and saves:
+      - a CSV of per-county RMSEs
+      - a figure per county (truth vs pred over time)
+    """
+    if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
+        return
+
+    # Align truth (wide) and pred (long→wide) on common timestamps and locations
+    df_t = df_truth_wide.copy()
+    df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
+    tw = df_t.set_index("timestamp").sort_index()
+
+    df_p = df_pred_long.copy()
+    df_p["timestamp"] = pd.to_datetime(df_p["timestamp"], errors="coerce").astype("datetime64[ns]")
+    df_p["location"]  = df_p["location"].astype(str)
+    df_p = df_p.dropna(subset=["timestamp", "location"])
+    df_p = df_p.groupby(["timestamp", "location"], as_index=False, sort=False)["pred"].mean()
+    pw = df_p.pivot_table(index="timestamp", columns="location", values="pred", aggfunc="mean").sort_index()
+
+    common_ts = tw.index.intersection(pw.index)
+    if len(common_ts) == 0:
+        return
+    tw = tw.loc[common_ts]
+    pw = pw.loc[common_ts]
+
+    locs = sorted(set(tw.columns).intersection(pw.columns))
+    if len(locs) == 0:
+        return
+
+    # Compute RMSE per county
+    rows = []
+    for loc in locs:
+        y_true = tw[loc].to_numpy()
+        y_pred = pw[loc].to_numpy()
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if not np.any(mask):
+            continue
+        rmse = float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
+        rows.append({"location": loc, "rmse": rmse})
+    if not rows:
+        return
+    df_rmse = pd.DataFrame(rows).sort_values("rmse").reset_index(drop=True)
+
+    # Save per-county RMSE CSV
+    csv_path = os.path.join(out_dir, f"val_per_county_rmse_epoch{epoch}_{label}.csv")
+    df_rmse.to_csv(csv_path, index=False)
+    print(f"[Val {label}] Saved per-county RMSE table: {csv_path}")
+
+    # One figure per county (truth vs pred)
+    for loc in locs:
+        y_true = tw[loc]
+        y_pred = pw[loc]
+        common = y_true.index.intersection(y_pred.index)
+        if len(common) == 0:
+            continue
+        df_plot = pd.DataFrame({
+            "timestamp": common,
+            "truth": y_true.loc[common].values,
+            "pred": y_pred.loc[common].values
+        }).sort_values("timestamp")
+
+        safe_loc = str(loc).replace("/", "-").replace("\\", "-").replace(" ", "_")
+        fig_path = os.path.join(out_dir, f"val_curve_epoch{epoch}_{label}_county_{safe_loc}.png")
+        plt.figure(figsize=(8, 3))
+        plt.plot(df_plot["timestamp"], df_plot["truth"], label="Truth")
+        plt.plot(df_plot["timestamp"], df_plot["pred"], label="Prediction")
+        plt.title(f"{label} - {loc}")
+        plt.xlabel("timestamp"); plt.ylabel("outage")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(fig_path)
+        plt.close()
+    print(f"[Val {label}] Saved county-wise figures to: {out_dir}")
 
 # -------------------- PatchTST encoder --------------------
 class PatchTSTEncoder(nn.Module):
@@ -930,6 +1013,8 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                 fig.savefig(fig_path)
                 plt.close(fig)
                 print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
+
+            _per_county_rmse_table_and_plots(df_truth_val, df_pred_val, OUT_DIR, epoch, label)
 
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
