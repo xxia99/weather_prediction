@@ -42,7 +42,7 @@ EVENT_METHOD   = "mean"
 STORM_TOP_Q    = 0.80
 CALM_BOTTOM_Q  = 0.50
 CALM_N         = 10
-BEST_BY        = "overall"
+BEST_BY        = "calm"  #"overall"
 
 
 def _all_zero_rmse_for_truth(df_truth_wide: pd.DataFrame) -> float:

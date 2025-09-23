@@ -40,7 +40,7 @@ EVENT_METHOD   = "mean"   # or "max"
 STORM_TOP_Q    = 0.80     # top 20% days = stormy
 CALM_BOTTOM_Q  = 0.50     # bottom 50% pool = calm
 CALM_N         = 10       # sample 10 calm days
-BEST_BY        = "overall"  # "overall" | "calm" | "storm"
+BEST_BY        = "calm"  # "overall" | "calm" | "storm"
 
 # ---------------- utils ----------------
 def open_ds(path):

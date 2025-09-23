@@ -12,11 +12,27 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 from moe import MoE
 
+
+class FocalLoss(nn.Module):
+    """Binary focal loss with optional class balancing."""
+    def __init__(self, gamma=2.0, pos_weight=1.0):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+
+    def forward(self, logits, target):
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none",
+                                                 pos_weight=torch.tensor([self.pos_weight], device=logits.device))
+        prob = torch.sigmoid(logits)
+        pt = prob * target + (1 - prob) * (1 - target)
+        loss = ((1 - pt) ** self.gamma) * bce
+        return loss.mean()
+
 # =========================
 # Config
 # =========================
 SPLIT_DIR   = "data/"
-OUT_DIR     = "results_lora/new"
+OUT_DIR     = "results_lora/new_curriculum"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 DEVICE = "cuda:3" if torch.cuda.is_available() else "cpu"
@@ -72,8 +88,10 @@ W_OUTAGE_FORECAST = 0#1.0
 
 # ---------- NEW: Outage classification (weather-only) ----------
 W_CLS             = 1.0        # weight for classification loss
-CLS_POS_WEIGHT    = 6.0        # BCE pos_weight to fight imbalance (tune)
+CLS_POS_WEIGHT    = 6.0        # BCE/Focal pos_weight to fight imbalance (tune)
 CLS_DROPOUT       = 0.1
+FOCAL_GAMMA       = 2.0        # focusing parameter for FocalLoss
+CURRICULUM_EPOCHS = 10         # warmup epochs for classification loss
 W_MAG             = 1.0        # weight for outage magnitude loss
 W_SPIKE           = 0.1        # weight for spike quantile loss
 QUANTILE_TAU      = 0.9        # high quantile for residual spikes
@@ -825,6 +843,14 @@ def train_multitask_contrast(ds_train):
     )
     dataset = TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
                             torch.tensor(Y_fut_tr, dtype=torch.float32))
+    # derive positive outage ratio for FocalLoss
+    y_future_out = Y_fut_tr[..., 0]
+    pos_ratio = float((y_future_out > 0).mean())
+    if pos_ratio > 0 and pos_ratio < 1:
+        cls_pos_weight = (1 - pos_ratio) / pos_ratio
+    else:
+        cls_pos_weight = CLS_POS_WEIGHT
+    print(f"[Pretrain] outage positive ratio={pos_ratio:.4f} -> pos_weight={cls_pos_weight:.2f}")
 
     sample_weights = np.ones(len(dataset), dtype=float)
     if STORM_SAMPLING and len(dataset) > 0:
@@ -884,9 +910,10 @@ def train_multitask_contrast(ds_train):
 
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
                            lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
 
-    # BCE with class imbalance handling
-    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([CLS_POS_WEIGHT], device=DEVICE))
+    # Focal loss with class imbalance handling
+    bce = FocalLoss(gamma=FOCAL_GAMMA, pos_weight=cls_pos_weight)
 
     best = {"loss": float("inf"), "epoch": -1}
 
@@ -984,6 +1011,7 @@ def train_multitask_contrast(ds_train):
         epoch_loss = 0.0
         seen_samples = 0
         start = time.time()
+        cls_scale = min(1.0, epoch / float(CURRICULUM_EPOCHS))
 
         for xb, yb in tqdm(loader, desc=f"Pretrain Epoch {epoch}/{EPOCHS}", leave=False):
             xb = xb.to(DEVICE)      # (B, T, 1, 110)
@@ -1058,7 +1086,7 @@ def train_multitask_contrast(ds_train):
                 W_SSL * loss_ssl
                 + W_FORECAST * loss_fore
                 + W_CONTRAST * loss_contrast
-                + W_CLS * loss_cls
+                + (W_CLS * cls_scale) * loss_cls
                 + W_MAG * loss_mag
                 + W_SPIKE * loss_spike
             )
@@ -1096,6 +1124,8 @@ def train_multitask_contrast(ds_train):
         else:
             print(f"[Pretrain Val] Classifier ratios — Zero→Nonzero=nan (all-zero=nan) | "
                   f"Nonzero→Zero=nan (all-zero=nan)")
+
+        scheduler.step()
 
         # ---------- Save best by BEST_BY ('loss' expected) ----------
         metric_map = {

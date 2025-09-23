@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.swa_utils import AveragedModel
 import matplotlib.pyplot as plt
 from demo_evaluate import load_truth_wide, per_county_rmse_mean
 # (we no longer call event_stratified_report to avoid duplicate prints)
@@ -60,7 +61,9 @@ TRAIN_LAST_DAY = 85   # days 1..80 train; day-ahead roll on 81..end
 # ---------------- config ----------------
 SPLIT_DIR = "data/"
 BEST_BY        = "overall"  # "overall" | "calm" | "storm"
-OUT_DIR   = f"results_CB/per_county_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}_{BEST_BY}"
+# NEW: if True, override model selection to use RMSE from the LAST validation day only
+SELECT_BEST_BY_LAST_VAL_DAY = True
+OUT_DIR   = f"results_CB/val_per_day_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}_{BEST_BY}"
 # OUT_DIR   = f"results_non-pre-CB/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
 # OUT_DIR   = f"results_pre-patch/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
 # OUT_DIR   = f"results_non-pre-patch/update_distribution_{TRAIN_LAST_DAY}/seed{GLOBAL_SEED}/epoch{EPOCHS}"
@@ -169,15 +172,10 @@ def _per_county_rmse_table_and_plots(df_truth_wide: pd.DataFrame,
                                      out_dir: str,
                                      epoch: int,
                                      label: str):
-    """
-    Computes RMSE per county and saves:
-      - a CSV of per-county RMSEs
-      - a figure per county (truth vs pred over time)
-    """
     if df_truth_wide is None or df_truth_wide.empty or df_pred_long is None or df_pred_long.empty:
         return
 
-    # Align truth (wide) and pred (long→wide) on common timestamps and locations
+    # --- Align truth (wide) and pred (long→wide)
     df_t = df_truth_wide.copy()
     df_t["timestamp"] = pd.to_datetime(df_t["timestamp"], errors="coerce").astype("datetime64[ns]")
     df_t = df_t.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"], keep="last")
@@ -200,26 +198,43 @@ def _per_county_rmse_table_and_plots(df_truth_wide: pd.DataFrame,
     if len(locs) == 0:
         return
 
-    # Compute RMSE per county
-    rows = []
-    for loc in locs:
-        y_true = tw[loc].to_numpy()
-        y_pred = pw[loc].to_numpy()
+    # --- Build long dataframe with truth/pred (ensure 'location' exists)
+    truth_long = (
+        tw[locs].stack()
+        .rename("truth")
+        .reset_index()
+        .rename(columns={"level_1": "location"})
+    )
+    pred_long = (
+        pw[locs].stack()
+        .rename("pred")
+        .reset_index()
+        .rename(columns={"level_1": "location"})
+    )
+    # normalize dtypes
+    truth_long["location"] = truth_long["location"].astype(str)
+    pred_long["location"]  = pred_long["location"].astype(str)
+
+    df_join = pd.merge(truth_long, pred_long, on=["timestamp", "location"], how="inner")
+
+    # per-location RMSE and attach
+    def _rmse(group):
+        y_true = group["truth"].to_numpy()
+        y_pred = group["pred"].to_numpy()
         mask = np.isfinite(y_true) & np.isfinite(y_pred)
         if not np.any(mask):
-            continue
-        rmse = float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
-        rows.append({"location": loc, "rmse": rmse})
-    if not rows:
-        return
-    df_rmse = pd.DataFrame(rows).sort_values("rmse").reset_index(drop=True)
+            return np.nan
+        return float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
+    rmse_by_loc = df_join.groupby("location", as_index=False).apply(_rmse).rename(columns={None: "rmse"})
+    df_join = df_join.merge(rmse_by_loc, on="location", how="left")
 
-    # Save per-county RMSE CSV
-    csv_path = os.path.join(out_dir, f"val_per_county_rmse_epoch{epoch}_{label}.csv")
-    df_rmse.to_csv(csv_path, index=False)
-    print(f"[Val {label}] Saved per-county RMSE table: {csv_path}")
+    # --- Save one CSV with truth/pred/RMSE
+    csv_path = os.path.join(out_dir, f"val_truth_pred_rmse_epoch{epoch}_{label}.csv")
+    df_join = df_join[["location", "timestamp", "truth", "pred", "rmse"]]
+    df_join.to_csv(csv_path, index=False)
+    print(f"[Val {label}] Saved truth/pred/RMSE table: {csv_path}")
 
-    # One figure per county (truth vs pred)
+    # --- Per-county PNGs (kept)
     for loc in locs:
         y_true = tw[loc]
         y_pred = pw[loc]
@@ -244,6 +259,44 @@ def _per_county_rmse_table_and_plots(df_truth_wide: pd.DataFrame,
         plt.savefig(fig_path)
         plt.close()
     print(f"[Val {label}] Saved county-wise figures to: {out_dir}")
+
+    # --- NEW: one multi-panel figure for ALL locations
+    n_loc = len(locs)
+    n_cols = min(10, max(1, int(np.ceil(np.sqrt(n_loc)))))
+    n_rows = int(np.ceil(n_loc / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.6, n_rows * 2.0), sharex=False)
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    axes = axes.reshape(n_rows, n_cols)
+
+    for idx, loc in enumerate(locs):
+        r, c = divmod(idx, n_cols)
+        ax = axes[r, c]
+        y_true = tw[loc]
+        y_pred = pw[loc]
+        common = y_true.index.intersection(y_pred.index)
+        if len(common) == 0:
+            ax.axis("off")
+            continue
+        ax.plot(common, y_true.loc[common].values, label="Truth")
+        ax.plot(common, y_pred.loc[common].values, label="Pred")
+        ax.set_title(str(loc), fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    for extra in range(n_loc, n_rows * n_cols):
+        r, c = divmod(extra, n_cols)
+        axes[r, c].axis("off")
+
+    handles, labels_ = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels_, loc="upper center", ncol=2, fontsize=9)
+        plt.subplots_adjust(top=0.92)
+
+    fig.tight_layout()
+    fig_path_all = os.path.join(out_dir, f"val_curves_epoch{epoch}_{label}_ALL_LOCATIONS.png")
+    fig.savefig(fig_path_all, dpi=150)
+    plt.close(fig)
+    print(f"[Val {label}] Saved multi-location figure: {fig_path_all}")
 
 # -------------------- PatchTST encoder --------------------
 class PatchTSTEncoder(nn.Module):
@@ -820,6 +873,40 @@ def _zero_nonzero_ratios(df_truth_wide: pd.DataFrame, df_pred_long: pd.DataFrame
     return float(z_to_nz), float(nz_to_z)
 
 # ---- event helpers for reporting ----
+def _per_day_rmse(ds_train, df_truth_wide, df_pred_long, train_last_day):
+    """
+    Returns a list of dicts:
+      [{"day": int, "rmse": float, "zero_rmse": float}], for all validation days > train_last_day.
+    """
+    if df_truth_wide.empty or df_pred_long.empty:
+        return []
+
+    ts_map = pd.DataFrame({"timestamp": pd.to_datetime(ds_train.timestamp.values),
+                           "day": _compute_day_indices(ds_train.timestamp.values)[0]})
+    # keep only timestamps present in both truth & pred
+    ts_truth = pd.to_datetime(df_truth_wide["timestamp"].values)
+    ts_pred  = pd.to_datetime(df_pred_long["timestamp"].values)
+    ts_common = np.intersect1d(ts_truth.astype("datetime64[ns]"), ts_pred.astype("datetime64[ns]"))
+
+    ts_day = ts_map[ts_map["timestamp"].isin(ts_common)]
+    val_days = sorted([d for d in ts_day["day"].unique().tolist() if d > int(train_last_day)])
+
+    rows = []
+    for d in val_days:
+        ts_subset = ts_day[ts_day["day"] == d]["timestamp"]
+        truth_d, pred_d = _filter_truth_pred_by_days(df_truth_wide, df_pred_long, pd.DatetimeIndex(ts_subset))
+        if not truth_d.empty:
+            zero_d = _all_zero_rmse_for_truth(truth_d)
+        else:
+            zero_d = float("nan")
+        rmse_d = per_county_rmse_mean(truth_d, pred_d) if (not truth_d.empty and not pred_d.empty) else float("nan")
+        rows.append({
+            "day": int(d),
+            "rmse": float(rmse_d) if np.isfinite(rmse_d) else float("nan"),
+            "zero_rmse": float(zero_d) if np.isfinite(zero_d) else float("nan")
+        })
+    return rows
+
 def _per_day_outage_score(ds_train, method: str = "mean"):
     ts = ds_train.timestamp.values
     days, _, _ = _compute_day_indices(ts)
@@ -898,14 +985,17 @@ def _event_rmse_blocks(ds_train, df_truth_val, df_pred_val,
     return rmse_overall, zero_overall, rmse_calm, zero_calm, n_calm, rmse_storm, zero_storm, n_storm
 
 def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
-                              train_last_day=80,
+                              train_last_day=TRAIN_LAST_DAY,
                               ts_future_test=None, df_truth_test=None, zero_rmse_test=float("nan")):
     best = {"rmse": float("inf"), "epoch": -1}
+    # Track best-by-last-day separately (so normal BEST_BY still works if toggle = False)
+    best_lastday = {"rmse": float("inf"), "epoch": -1}
     df_truth_val = truth_wide_for_val(ds_train, aux, horizon, train_last_day)
 
     def _callback(model, epoch):
         df_pred_val = predict_val_roll(ds_train, model, scalers, horizon, aux, train_last_day)
 
+        # ---- existing calm/storm/overall blocks (unchanged) ----
         (rmse_overall, zero_overall,
          rmse_calm, zero_calm, n_calm,
          rmse_storm, zero_storm, n_storm) = _event_rmse_blocks(
@@ -915,9 +1005,29 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
             storm_top_q=STORM_TOP_Q,
             calm_bottom_q=CALM_BOTTOM_Q,
             calm_n=CALM_N,
-            seed=GLOBAL_SEED  # === SEEDING: use global seed instead of hard-coded 42
+            seed=42
         )
 
+        # ---- NEW: compute per-day RMSEs for validation window ----
+        per_day = _per_day_rmse(ds_train, df_truth_val, df_pred_val, train_last_day)
+        if per_day:
+            # Save CSV per epoch (now includes column 'zero_rmse')
+            df_day = pd.DataFrame(per_day)
+            csv_day = os.path.join(OUT_DIR, f"val_rmse_per_day_epoch{epoch}_{label}.csv")
+            df_day.to_csv(csv_day, index=False)
+
+            # Print nicely with all-zero baseline
+            def _fmt(v):
+                return f"{v:.4f}" if np.isfinite(v) else "nan"
+
+            pretty = ", ".join([f"Day {r['day']}: {_fmt(r['rmse'])} (zero={_fmt(r['zero_rmse'])})" for r in per_day])
+            print(f"[Val {label}] Epoch {epoch}: Per-day RMSEs -> {pretty}")
+            # Last validation day RMSE (model)
+            last_day_rmse = per_day[-1]["rmse"] if np.isfinite(per_day[-1]["rmse"]) else float("inf")
+        else:
+            last_day_rmse = float("inf")
+
+        # ---- existing prints (unchanged) ----
         zpnz_model, nzpz_model = _zero_nonzero_ratios(df_truth_val, df_pred_val, eps=ZERO_EPS)
         if not df_truth_val.empty:
             locs = [c for c in df_truth_val.columns if c != "timestamp"]
@@ -935,9 +1045,9 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         else:
             print(f"[Val {label}] Epoch {epoch}: Rolling RMSE=nan (all-zero=nan)")
 
-        print(f"[Val {label}] Epoch {epoch}: Zero→Nonzero ratio={zpnz_model if np.isfinite(zpnz_model) else float('nan'):.4f} "
+        print(f"[Val {label}] Epoch {epoch}: Zero→Nonzero={zpnz_model if np.isfinite(zpnz_model) else float('nan'):.4f} "
               f"(all-zero={zpnz_zero if np.isfinite(zpnz_zero) else float('nan'):.4f}) | "
-              f"Nonzero→Zero ratio={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
+              f"Nonzero→Zero={nzpz_model if np.isfinite(nzpz_model) else float('nan'):.4f} "
               f"(all-zero={nzpz_zero if np.isfinite(nzpz_zero) else float('nan'):.4f})")
 
         if np.isfinite(rmse_calm):
@@ -950,14 +1060,23 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
         else:
             print(f"[EventEval {label}] Storm-heavy: RMSE=nan (all-zero=nan)")
 
+        # ---- Selection value: BEST_BY or LAST-VALIDATION-DAY (toggle) ----
         metric_map = {"overall": rmse_overall, "calm": rmse_calm, "storm": rmse_storm}
         sel = metric_map.get(str(BEST_BY).lower(), rmse_overall)
         sel_val = sel if np.isfinite(sel) else rmse_overall
 
+        # Track normal best (as before)
         if np.isfinite(sel_val) and sel_val < best["rmse"]:
             best["rmse"] = sel_val
             best["epoch"] = epoch
             save_path = os.path.join(OUT_DIR, f"best_enc-dec_{label}.pt")
+            if isinstance(model, AveragedModel):
+                sd_base = model.module.state_dict()
+                sd_swa  = model.state_dict()
+            else:
+                sd_base = model.state_dict()
+                sd_swa  = None
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -966,60 +1085,76 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                     "rmse_overall": rmse_overall,
                     "rmse_calm": rmse_calm,
                     "rmse_storm": rmse_storm,
+                    "rmse_last_val_day": last_day_rmse,
                     "best_by": str(BEST_BY).lower(),
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": sd_base,
+                    "model_state_dict_swa": sd_swa,
                 },
                 save_path,
             )
             print(f"[Val {label}] New best ({BEST_BY}) RMSE {sel_val:.4f} at epoch {epoch}. Saved: {save_path}")
 
-            ts_map = pd.DataFrame({
-                "timestamp": pd.to_datetime(aux["timestamps"]),
-                "day": aux["days"]
-            })
-            df_pred_day = df_pred_val.merge(ts_map, on="timestamp", how="left")
+            # (existing day-wise save & figures stay unchanged below)
+            ts_map = pd.DataFrame({"timestamp": pd.to_datetime(aux["timestamps"]), "day": aux["days"]})
+            df_pred_day  = df_pred_val.merge(ts_map, on="timestamp", how="left")
             df_truth_day = df_truth_val.merge(ts_map, on="timestamp", how="left")
-
             unique_days = sorted(df_pred_day["day"].dropna().unique())
             for d in unique_days:
-                pred_d = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
+                pred_d  = df_pred_day[df_pred_day["day"] == d].drop(columns="day")
                 truth_d = df_truth_day[df_truth_day["day"] == d].drop(columns="day")
-                pred_path = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
+                pred_path  = os.path.join(OUT_DIR, f"val_pred_epoch{epoch}_day{int(d)}_{label}.csv")
                 truth_path = os.path.join(OUT_DIR, f"val_truth_epoch{epoch}_day{int(d)}_{label}.csv")
-                pred_d.to_csv(pred_path, index=False)
-                truth_d.to_csv(truth_path, index=False)
+                pred_d.to_csv(pred_path, index=False); truth_d.to_csv(truth_path, index=False)
                 print(f"[Val {label}] Saved day {int(d)} prediction/truth data: {pred_path}, {truth_path}")
 
             if unique_days:
                 fig, axes = plt.subplots(len(unique_days), 1, figsize=(8, 3 * len(unique_days)), sharex=False)
-                if len(unique_days) == 1:
-                    axes = [axes]
+                if len(unique_days) == 1: axes = [axes]
                 for ax, d in zip(axes, unique_days):
                     truth_d = df_truth_day[df_truth_day["day"] == d].set_index("timestamp").drop(columns="day")
                     truth_mean = truth_d.mean(axis=1).reset_index(name="truth")
-                    pred_mean = (
-                        df_pred_day[df_pred_day["day"] == d]
-                        .groupby("timestamp")["pred"].mean().reset_index()
-                    )
+                    pred_mean  = df_pred_day[df_pred_day["day"] == d].groupby("timestamp")["pred"].mean().reset_index()
                     merged = pd.merge(truth_mean, pred_mean, on="timestamp", how="inner").sort_values("timestamp")
                     ax.plot(merged["timestamp"], merged["truth"], label="Truth")
                     ax.plot(merged["timestamp"], merged["pred"], label="Prediction")
-                    ax.set_title(f"Day {int(d)}")
-                    ax.set_xlabel("timestamp")
-                    ax.set_ylabel("outage")
-                    ax.legend()
-                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
+                    ax.set_title(f"Day {int(d)}"); ax.set_xlabel("timestamp"); ax.set_ylabel("outage"); ax.legend()
                 fig.tight_layout()
+                fig_path = os.path.join(OUT_DIR, f"val_curve_epoch{epoch}_{label}.png")
                 fig.savefig(fig_path)
                 plt.close(fig)
                 print(f"[Val {label}] Saved prediction vs truth plot: {fig_path}")
 
             _per_county_rmse_table_and_plots(df_truth_val, df_pred_val, OUT_DIR, epoch, label)
 
+        # ---- NEW: Optional best-by-last-validation-day selection ----
+        if SELECT_BEST_BY_LAST_VAL_DAY and np.isfinite(last_day_rmse) and (last_day_rmse < best_lastday["rmse"]):
+            best_lastday["rmse"]  = last_day_rmse
+            best_lastday["epoch"] = epoch
+            save_path = os.path.join(OUT_DIR, f"best_lastday_{label}.pt")
+            if isinstance(model, AveragedModel):
+                sd_base = model.module.state_dict()
+                sd_swa  = model.state_dict()
+            else:
+                sd_base = model.state_dict()
+                sd_swa  = None
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "label": label,
+                    "rmse_last_val_day": last_day_rmse,
+                    "best_by": "last_val_day",
+                    "model_state_dict": sd_base,
+                    "model_state_dict_swa": sd_swa,
+                },
+                save_path,
+            )
+            print(f"[Val {label}] New best-by-last-day RMSE {last_day_rmse:.4f} at epoch {epoch}. Saved: {save_path}")
+
+        # ---- (keep your optional test logging unchanged) ----
         if ts_future_test is not None and df_truth_test is not None and len(ts_future_test) > 0:
             df_pred_test = predict_per_county(ds_train, model, scalers, horizon, ts_future_test)
             rmse_test = per_county_rmse_mean(df_truth_test, df_pred_test)
-
             zpnz_t, nzpz_t = _zero_nonzero_ratios(df_truth_test, df_pred_test, eps=ZERO_EPS)
             locs_t = [c for c in df_truth_test.columns if c != "timestamp"]
             df_zero_long_t = pd.DataFrame({
@@ -1028,14 +1163,14 @@ def make_val_callback_rolling(ds_train, scalers, horizon, aux, label,
                 "pred": 0.0
             })
             zpnz_t0, nzpz_t0 = _zero_nonzero_ratios(df_truth_test, df_zero_long_t, eps=ZERO_EPS)
-
             print(f"[Val {label}] Epoch {epoch}: Testing RMSE={rmse_test:.4f} (all-zero RMSE={zero_rmse_test:.4f})")
-            print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero ratio={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
+            print(f"[Val {label}] Epoch {epoch}: Test Zero→Nonzero={zpnz_t if np.isfinite(zpnz_t) else float('nan'):.4f} "
                   f"(all-zero={zpnz_t0 if np.isfinite(zpnz_t0) else float('nan'):.4f}) | "
-                  f"Nonzero→Zero ratio={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
+                  f"Nonzero→Zero={nzpz_t if np.isfinite(nzpz_t) else float('nan'):.4f} "
                   f"(all-zero={nzpz_t0 if np.isfinite(nzpz_t0) else float('nan'):.4f})")
 
     return _callback
+
 
 # ---------------- NEW: weighted pinball loss ----------------
 def _pinball_loss(yq, y_true, q_list, sample_weight=None, quantile_weights=None):
